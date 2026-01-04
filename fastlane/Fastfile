@@ -1,0 +1,52 @@
+# Fastfile for Screenshot Generator
+# This is used as a fallback if accessibility exploration isn't sufficient
+
+default_platform(:ios)
+
+platform :ios do
+  desc "Capture screenshots using Fastlane Snapshot"
+  lane :capture_screenshots do |options|
+    # Get parameters
+    scheme = options[:scheme] || ENV['SCHEME'] || 'UITests'
+    output_dir = options[:output_directory] || ENV['OUTPUT_DIR'] || './screenshots'
+    
+    # Run snapshot
+    capture_ios_screenshots(
+      scheme: scheme,
+      output_directory: output_dir,
+      clear_previous_screenshots: true,
+      skip_open_summary: true,
+      concurrent_simulators: false,
+      reinstall_app: false
+    )
+  end
+  
+  desc "Install app on simulator"
+  lane :install_app do |options|
+    app_path = options[:app_path] || ENV['APP_PATH']
+    device = options[:device] || ENV['DEVICE_NAME'] || 'iPhone 15 Pro Max'
+    
+    # Boot simulator
+    sh("xcrun simctl boot '#{device}' 2>/dev/null || true")
+    
+    # Wait for boot
+    sh("xcrun simctl bootstatus '#{device}' -b")
+    
+    # Install app
+    sh("xcrun simctl install '#{device}' '#{app_path}'")
+    
+    UI.success("App installed on #{device}")
+  end
+  
+  desc "Cleanup simulators"
+  lane :cleanup do
+    # Shutdown all simulators
+    sh("xcrun simctl shutdown all 2>/dev/null || true")
+    
+    # Erase simulators (optional, for fresh state)
+    # sh("xcrun simctl erase all 2>/dev/null || true")
+    
+    UI.success("Simulators cleaned up")
+  end
+end
+

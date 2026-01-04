@@ -1,0 +1,47 @@
+# Snapfile Configuration
+# Used for Fastlane Snapshot (fallback method)
+
+# Devices to capture screenshots on
+devices([
+  "iPhone 15 Pro Max",
+  "iPad Pro (12.9-inch) (6th generation)"
+])
+
+# Languages for screenshots
+languages([
+  "en-US"
+])
+
+# The name of the scheme which contains the UI Tests
+scheme("UITests")
+
+# Where should the resulting screenshots be stored?
+output_directory("./screenshots")
+
+# Clear all previously generated screenshots before creating new ones
+clear_previous_screenshots(true)
+
+# Don't open the summary after taking the screenshots
+skip_open_summary(true)
+
+# Don't run concurrent simulators (more stable)
+concurrent_simulators(false)
+
+# Erase simulators before running
+erase_simulator(false)
+
+# Reinstall the app before each run
+reinstall_app(false)
+
+# Stop the simulators after the tests are complete
+stop_after_first_error(false)
+
+# Only use the simulators that are already booted
+override_status_bar(false)
+
+# Arguments to pass to the app on launch
+# launch_arguments(["-UITests"])
+
+# Set status bar time for consistent screenshots
+# status_bar_time("9:41"
+

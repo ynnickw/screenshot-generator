@@ -1,0 +1,190 @@
+name: Generate Screenshots
+
+on:
+  repository_dispatch:
+    types: [generate-screenshots]
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+  WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+
+jobs:
+  generate:
+    runs-on: macos-14
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Setup Node.js (for upload scripts)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Create output directories
+        run: |
+          mkdir -p screenshots/iphone
+          mkdir -p screenshots/ipad
+          mkdir -p extracted
+
+      - name: Download IPA
+        run: |
+          echo "Downloading IPA from: ${{ github.event.client_payload.ipa_path }}"
+          curl -L -o app.ipa "${{ github.event.client_payload.ipa_path }}"
+          ls -la app.ipa
+
+      - name: Extract IPA
+        id: extract
+        run: |
+          unzip -q app.ipa -d extracted
+          APP_PATH=$(find extracted -name "*.app" -type d | head -1)
+          echo "App path: $APP_PATH"
+          
+          if [ -z "$APP_PATH" ]; then
+            echo "Error: No .app found in IPA"
+            exit 1
+          fi
+          
+          BUNDLE_ID=$(plutil -extract CFBundleIdentifier raw "$APP_PATH/Info.plist")
+          VERSION=$(plutil -extract CFBundleShortVersionString raw "$APP_PATH/Info.plist")
+          BUILD_NUMBER=$(plutil -extract CFBundleVersion raw "$APP_PATH/Info.plist")
+          DISPLAY_NAME=$(plutil -extract CFBundleDisplayName raw "$APP_PATH/Info.plist" 2>/dev/null || echo "")
+          
+          echo "Bundle ID: $BUNDLE_ID"
+          echo "Version: $VERSION"
+          echo "Build: $BUILD_NUMBER"
+          echo "Display Name: $DISPLAY_NAME"
+          
+          echo "app_path=$APP_PATH" >> $GITHUB_OUTPUT
+          echo "bundle_id=$BUNDLE_ID" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "build_number=$BUILD_NUMBER" >> $GITHUB_OUTPUT
+
+      - name: Boot iPhone Simulator
+        run: |
+          echo "Booting iPhone 15 Pro Max simulator..."
+          xcrun simctl boot "iPhone 15 Pro Max" || true
+          xcrun simctl bootstatus "iPhone 15 Pro Max" -b
+          echo "iPhone simulator ready"
+
+      - name: Install App on iPhone
+        run: |
+          echo "Installing app on iPhone..."
+          xcrun simctl install "iPhone 15 Pro Max" "${{ steps.extract.outputs.app_path }}"
+          echo "App installed on iPhone"
+
+      - name: Capture iPhone Screenshots
+        env:
+          CREDENTIALS: ${{ github.event.client_payload.credentials }}
+          DEVICE_NAME: "iPhone 15 Pro Max"
+          OUTPUT_DIR: "screenshots/iphone"
+          BUNDLE_ID: ${{ steps.extract.outputs.bundle_id }}
+        run: |
+          echo "Capturing iPhone screenshots..."
+          swift scripts/accessibility-explorer.swift
+          echo "iPhone screenshots captured"
+          ls -la screenshots/iphone/
+
+      - name: Shutdown iPhone Simulator
+        run: |
+          xcrun simctl shutdown "iPhone 15 Pro Max" || true
+
+      - name: Boot iPad Simulator
+        run: |
+          echo "Booting iPad Pro simulator..."
+          xcrun simctl boot "iPad Pro (12.9-inch) (6th generation)" || true
+          xcrun simctl bootstatus "iPad Pro (12.9-inch) (6th generation)" -b
+          echo "iPad simulator ready"
+
+      - name: Install App on iPad
+        run: |
+          echo "Installing app on iPad..."
+          xcrun simctl install "iPad Pro (12.9-inch) (6th generation)" "${{ steps.extract.outputs.app_path }}"
+          echo "App installed on iPad"
+
+      - name: Capture iPad Screenshots
+        env:
+          CREDENTIALS: ${{ github.event.client_payload.credentials }}
+          DEVICE_NAME: "iPad Pro (12.9-inch) (6th generation)"
+          OUTPUT_DIR: "screenshots/ipad"
+          BUNDLE_ID: ${{ steps.extract.outputs.bundle_id }}
+        run: |
+          echo "Capturing iPad screenshots..."
+          swift scripts/accessibility-explorer.swift
+          echo "iPad screenshots captured"
+          ls -la screenshots/ipad/
+
+      - name: Shutdown iPad Simulator
+        run: |
+          xcrun simctl shutdown "iPad Pro (12.9-inch) (6th generation)" || true
+
+      - name: Upload Screenshots to Supabase
+        id: upload
+        run: |
+          bash scripts/upload-screenshots.sh \
+            "${{ github.event.client_payload.job_id }}" \
+            "${{ steps.extract.outputs.bundle_id }}" \
+            "${{ steps.extract.outputs.version }}" \
+            "${{ steps.extract.outputs.build_number }}"
+
+      - name: Send Success Callback
+        if: success()
+        run: |
+          IPHONE_URLS=$(cat screenshots/iphone/urls.json 2>/dev/null || echo "[]")
+          IPAD_URLS=$(cat screenshots/ipad/urls.json 2>/dev/null || echo "[]")
+          
+          PAYLOAD=$(cat <<EOF
+          {
+            "jobId": "${{ github.event.client_payload.job_id }}",
+            "status": "completed",
+            "screenshots": {
+              "iphone": $IPHONE_URLS,
+              "ipad": $IPAD_URLS,
+              "partial": false
+            },
+            "bundleId": "${{ steps.extract.outputs.bundle_id }}",
+            "appVersion": "${{ steps.extract.outputs.version }}",
+            "buildNumber": "${{ steps.extract.outputs.build_number }}"
+          }
+          EOF
+          )
+          
+          echo "Sending success callback..."
+          curl -X POST "${{ github.event.client_payload.callback_url }}" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
+            -d "$PAYLOAD"
+
+      - name: Send Failure Callback
+        if: failure()
+        run: |
+          PAYLOAD=$(cat <<EOF
+          {
+            "jobId": "${{ github.event.client_payload.job_id }}",
+            "status": "failed",
+            "error": "Screenshot generation failed. Check workflow logs for details."
+          }
+          EOF
+          )
+          
+          echo "Sending failure callback..."
+          curl -X POST "${{ github.event.client_payload.callback_url }}" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
+            -d "$PAYLOAD"
+
+      - name: Upload Screenshots Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.event.client_payload.job_id }}
+          path: screenshots/
+          retention-days: 7
+

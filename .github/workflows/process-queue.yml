@@ -1,0 +1,36 @@
+name: Process Queue
+
+on:
+  schedule:
+    # Run every 5 minutes
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    # Allow manual trigger
+
+env:
+  SCREENSHOT_API_URL: ${{ secrets.SCREENSHOT_API_URL }}
+  API_KEY: ${{ secrets.API_KEY }}
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Trigger Queue Processing
+        run: |
+          echo "Triggering queue processing..."
+          
+          # Call the API to process the queue
+          # The API will handle checking for pending jobs and triggering workflows
+          
+          RESPONSE=$(curl -s -X POST "$SCREENSHOT_API_URL/process-queue" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Content-Type: application/json")
+          
+          echo "Response: $RESPONSE"
+
+      - name: Log Result
+        run: |
+          echo "Queue processing triggered at $(date)"
+
