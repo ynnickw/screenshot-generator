@@ -105,60 +105,163 @@ class SimulatorController {
         }
     }
     
+    func isAppInstalled() -> Bool {
+        // Check if app is installed using listapps
+        let checkResult = shell("xcrun simctl listapps '\(deviceName)' 2>/dev/null | grep -i '\(bundleId)' || echo ''")
+        return !checkResult.output.isEmpty
+    }
+    
+    func getForegroundApp() -> String? {
+        // Get the currently running app's bundle ID using a simpler method
+        // Check if our app's process is running and likely in foreground
+        let result = shell("xcrun simctl spawn '\(deviceName)' ps -A 2>/dev/null | grep -E '\(bundleId)|SpringBoard' | grep -v grep | head -1 || echo ''")
+        let output = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if output.contains(bundleId) && !output.contains("SpringBoard") {
+            return bundleId
+        }
+        return nil
+    }
+    
+    func isAppProcessRunning() -> Bool {
+        // Check if app process is actually running
+        let result = shell("xcrun simctl spawn '\(deviceName)' ps -A 2>/dev/null | grep -i '\(bundleId)' | grep -v grep || echo ''")
+        return !result.output.isEmpty
+    }
+    
     func launchApp(withArguments args: [String] = []) -> Bool {
         print("Launching app: \(bundleId)")
         
+        // First verify app is installed
+        if !isAppInstalled() {
+            print("  ❌ App is not installed on simulator!")
+            return false
+        }
+        print("  ✓ App is installed")
+        
         // Capture home screen hash before launch
         let homeScreenHash = captureCurrentScreenHash()
+        if homeScreenHash.isEmpty {
+            print("  ⚠️ Could not capture home screen, continuing anyway...")
+        }
+        
+        // Make sure we're on home screen first
+        pressHome()
+        sleep(1)
         
         let result: (output: String, exitCode: Int32)
         if args.isEmpty {
-            result = shell("xcrun simctl launch '\(deviceName)' '\(bundleId)'")
+            print("  → Executing: xcrun simctl launch '\(deviceName)' '\(bundleId)'")
+            result = shell("xcrun simctl launch '\(deviceName)' '\(bundleId)' 2>&1")
         } else {
             // Launch with arguments
             let argsString = args.map { "'\($0)'" }.joined(separator: " ")
-            result = shell("xcrun simctl launch '\(deviceName)' '\(bundleId)' \(argsString)")
+            print("  → Executing: xcrun simctl launch '\(deviceName)' '\(bundleId)' \(argsString)")
+            result = shell("xcrun simctl launch '\(deviceName)' '\(bundleId)' \(argsString) 2>&1")
+        }
+        
+        // Check launch output for errors
+        if !result.output.isEmpty {
+            print("  → Launch output: \(result.output)")
+            // xcrun simctl launch returns process ID on success (e.g., "12345")
+            // If output contains only digits, it's likely a successful launch
+            let trimmedOutput = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedOutput.isEmpty && trimmedOutput.allSatisfy({ $0.isNumber }) {
+                print("  ✓ Launch returned process ID: \(trimmedOutput)")
+            } else if trimmedOutput.lowercased().contains("error") || trimmedOutput.lowercased().contains("fail") {
+                print("  ⚠️ Launch output suggests an error")
+            }
         }
         
         if result.exitCode != 0 {
-            print("❌ Failed to launch app: \(result.output)")
+            print("  ❌ Launch command failed with exit code \(result.exitCode)")
+            print("  → Error: \(result.output)")
             return false
         }
         
         print("  → Launch command executed, waiting for app to appear...")
         
+        // Wait for app to start
+        sleep(3)
+        
+        // Check if app is in foreground
+        if let foregroundApp = getForegroundApp() {
+            print("  → Foreground app: \(foregroundApp)")
+            if foregroundApp.contains(bundleId) {
+                print("  ✓ App is in foreground!")
+                // Give it a moment to fully render
+                sleep(1)
+                return true
+            } else {
+                print("  ⚠️ Different app in foreground: \(foregroundApp)")
+            }
+        }
+        
+        // Check if screen changed
+        let quickCheck = captureCurrentScreenHash()
+        if quickCheck != homeScreenHash && !quickCheck.isEmpty {
+            print("  ✓ App launched successfully (screen changed)")
+            return true
+        }
+        
         // Wait for app to launch and verify it's actually running
         var attempts = 0
-        let maxAttempts = 10 // 10 seconds total
+        let maxAttempts = 8 // 4 seconds total
         
         while attempts < maxAttempts {
             usleep(500000) // 0.5 second
+            
+            // Check foreground app
+            if let foregroundApp = getForegroundApp(), foregroundApp.contains(bundleId) {
+                print("  ✓ App is now in foreground!")
+                sleep(1)
+                return true
+            }
+            
             let currentHash = captureCurrentScreenHash()
             
             // If screen changed from home screen, app likely launched
             if currentHash != homeScreenHash && !currentHash.isEmpty {
-                print("  ✓ App launched successfully (screen changed)")
+                print("  ✓ App launched successfully (screen changed on attempt \(attempts + 1))")
                 return true
             }
             
-            // Also check if app process is running using ps
-            let processCheck = shell("xcrun simctl spawn '\(deviceName)' ps aux | grep '\(bundleId)' | grep -v grep || echo ''")
-            if !processCheck.output.isEmpty {
-                print("  ✓ App process is running")
-                // Give it a bit more time for UI to appear
-                sleep(2)
-                let finalHash = captureCurrentScreenHash()
-                if finalHash != homeScreenHash && !finalHash.isEmpty {
-                    return true
+            // Check process on every 2nd attempt
+            if attempts % 2 == 0 {
+                if isAppProcessRunning() {
+                    print("  → App process detected (attempt \(attempts + 1))")
+                    // If process is running but screen hasn't changed, wait a bit more
+                    sleep(1)
+                    let processHash = captureCurrentScreenHash()
+                    if processHash != homeScreenHash && !processHash.isEmpty {
+                        print("  ✓ Screen changed after process check")
+                        return true
+                    }
                 }
             }
             
             attempts += 1
         }
         
-        print("  ⚠️ App launch timeout - screen may not have changed")
-        // Still return true if launch command succeeded, but log warning
-        return result.exitCode == 0
+        print("  ⚠️ App launch verification timeout after \(maxAttempts) attempts")
+        
+        // Final check: try to get foreground app one more time
+        if let foregroundApp = getForegroundApp() {
+            print("  → Final foreground check: \(foregroundApp)")
+            if foregroundApp.contains(bundleId) {
+                print("  ✓ App is in foreground on final check!")
+                return true
+            }
+        }
+        
+        // Check one final time if screen changed
+        let finalCheck = captureCurrentScreenHash()
+        if finalCheck != homeScreenHash && !finalCheck.isEmpty {
+            print("  ✓ App appeared on final screen check")
+            return true
+        }
+        
+        print("  ❌ App launch verification failed - app may not have launched")
+        return false
     }
     
     func terminateApp() {
@@ -269,11 +372,33 @@ class SimulatorController {
     
     func captureCurrentScreenHash() -> String {
         let tempPath = "\(outputDir)/temp_hash_check.png"
-        let screenshotResult = shell("xcrun simctl io '\(deviceName)' screenshot '\(tempPath)'")
+        // Remove old temp file if it exists
+        try? FileManager.default.removeItem(atPath: tempPath)
+        
+        // Take screenshot with explicit error handling
+        let screenshotResult = shell("xcrun simctl io '\(deviceName)' screenshot '\(tempPath)' 2>&1")
         if screenshotResult.exitCode != 0 {
+            print("    ⚠️ Screenshot failed: \(screenshotResult.output)")
             return ""
         }
-        let hashResult = shell("md5 -q '\(tempPath)'")
+        
+        // Check if file exists and has content (wait briefly if needed)
+        var fileExists = false
+        for _ in 0..<5 {
+            if FileManager.default.fileExists(atPath: tempPath) {
+                if let data = try? Data(contentsOf: URL(fileURLWithPath: tempPath)), !data.isEmpty {
+                    fileExists = true
+                    break
+                }
+            }
+            usleep(100000) // 0.1 second
+        }
+        
+        guard fileExists else {
+            return ""
+        }
+        
+        let hashResult = shell("md5 -q '\(tempPath)' 2>/dev/null")
         try? FileManager.default.removeItem(atPath: tempPath)
         return hashResult.output
     }
@@ -469,11 +594,22 @@ class AppExplorer {
         
         // Verify we're not still on home screen
         print("\n[Step 2.5/7] Verifying app is running...")
+        print("  → Capturing current screen for verification...")
         let homeScreenCheck = controller.captureCurrentScreenHash()
+        if homeScreenCheck.isEmpty {
+            print("  ⚠️ Could not capture screen hash, continuing anyway...")
+        } else {
+            print("  → Screen hash captured, waiting for app to load...")
+        }
+        
         sleep(2) // Give app more time to fully load
+        
+        print("  → Capturing screen again to check if app appeared...")
         let currentScreenCheck = controller.captureCurrentScreenHash()
         
-        if homeScreenCheck == currentScreenCheck && !homeScreenCheck.isEmpty {
+        if currentScreenCheck.isEmpty {
+            print("  ⚠️ Could not capture second screen hash, continuing...")
+        } else if homeScreenCheck == currentScreenCheck && !homeScreenCheck.isEmpty {
             print("  ⚠️ WARNING: Still on home screen - app may not have launched")
             print("  → Attempting to launch again...")
             controller.pressHome()
@@ -481,8 +617,51 @@ class AppExplorer {
             if !controller.launchApp() {
                 print("  ❌ CRITICAL: App failed to launch. Screenshots will show home screen.")
             } else {
+                print("  → App relaunched, waiting for UI...")
                 sleep(3) // Wait for app to fully load
             }
+        } else {
+            print("  ✓ Screen changed - app appears to be running")
+        }
+        
+        // Final verification: Make absolutely sure we're not on home screen
+        print("\n[Step 2.75/7] Final app launch verification...")
+        
+        // Check if app process is running
+        if !controller.isAppProcessRunning() {
+            print("  ❌ CRITICAL: App process is not running!")
+            print("  → Attempting emergency launch...")
+            controller.pressHome()
+            sleep(1)
+            if controller.launchApp() {
+                print("  ✓ Emergency launch succeeded")
+                sleep(2)
+            } else {
+                print("  ❌ FATAL: Cannot launch app. Aborting screenshot capture.")
+                print("  → This will result in home screen screenshots.")
+                print("  → Check app installation and bundle ID: \(controller.bundleId)")
+                // Continue anyway but log the error clearly
+            }
+        } else {
+            print("  ✓ App process is running")
+        }
+        
+        // Final screen check - compare with home screen
+        let finalScreenCheck = controller.captureCurrentScreenHash()
+        if finalScreenCheck == homeScreenCheck && !finalScreenCheck.isEmpty {
+            print("  ⚠️ WARNING: Still appears to be on home screen")
+            print("  → Attempting one more launch attempt...")
+            controller.pressHome()
+            sleep(1)
+            if controller.launchApp() {
+                print("  ✓ Final launch attempt succeeded")
+                sleep(2)
+            } else {
+                print("  ❌ Final launch attempt failed")
+                print("  → Screenshots will likely show home screen")
+            }
+        } else if !finalScreenCheck.isEmpty {
+            print("  ✓ Screen verification passed - app appears to be running")
         }
         
         // Capture launch screen
@@ -561,15 +740,14 @@ class AppExplorer {
     func injectEnvironmentVariables() {
         print("  → Setting environment variables...")
         // Some apps check environment variables for test mode
-        let envVars = [
+        // Note: simctl doesn't directly support env vars, but we can try via launch arguments
+        // This is more of a placeholder for future enhancement
+        _ = [
             "SKIP_ONBOARDING=true",
             "UITESTS_MODE=true",
             "TEST_MODE=true",
             "AUTOMATION=true"
         ]
-        
-        // Note: simctl doesn't directly support env vars, but we can try via launch arguments
-        // This is more of a placeholder for future enhancement
     }
     
     func attemptLaunchWithSkipArgs() -> Bool {
@@ -691,7 +869,7 @@ class AppExplorer {
         // Method 3: Try swiping through quickly (reduced from 5 to 3)
         print("  → Trying quick swipe through...")
         let swipeBeforeHash = captureCurrentScreenHash()
-        for i in 0..<3 {
+        for _ in 0..<3 {
             controller.swipeLeft()
             usleep(500000)
             let swipeAfterHash = captureCurrentScreenHash()
