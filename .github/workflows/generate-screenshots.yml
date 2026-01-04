@@ -86,6 +86,7 @@ jobs:
           DEVICE_NAME: "iPhone 15 Pro Max"
           OUTPUT_DIR: "screenshots/iphone"
           BUNDLE_ID: ${{ steps.extract.outputs.bundle_id }}
+          APP_PATH: ${{ steps.extract.outputs.app_path }}
         run: |
           echo "Capturing iPhone screenshots..."
           swift scripts/accessibility-explorer.swift
@@ -115,6 +116,7 @@ jobs:
           DEVICE_NAME: "iPad Pro (12.9-inch) (6th generation)"
           OUTPUT_DIR: "screenshots/ipad"
           BUNDLE_ID: ${{ steps.extract.outputs.bundle_id }}
+          APP_PATH: ${{ steps.extract.outputs.app_path }}
         run: |
           echo "Capturing iPad screenshots..."
           swift scripts/accessibility-explorer.swift

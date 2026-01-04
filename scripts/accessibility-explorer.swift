@@ -8,6 +8,7 @@ struct Config {
     static let deviceName = ProcessInfo.processInfo.environment["DEVICE_NAME"] ?? "iPhone 15 Pro Max"
     static let outputDir = ProcessInfo.processInfo.environment["OUTPUT_DIR"] ?? "screenshots"
     static let bundleId = ProcessInfo.processInfo.environment["BUNDLE_ID"] ?? ""
+    static let appPath = ProcessInfo.processInfo.environment["APP_PATH"] // Path to extracted .app
     static let credentialsJson = ProcessInfo.processInfo.environment["CREDENTIALS"]
     
     static var credentials: Credentials? {
@@ -22,6 +23,18 @@ struct Credentials: Codable {
     let password: String?
     let skipButtonText: String?
     let deepLink: String?
+}
+
+struct NavigationInfo {
+    var urlSchemes: [String] = []
+    var deepLinkPaths: [String] = []
+    var commonScreens: [String] = []
+}
+
+struct AppAnalysis {
+    let bundleId: String
+    let appPath: String?
+    var navigationInfo: NavigationInfo = NavigationInfo()
 }
 
 // MARK: - Simulator Controller
@@ -212,11 +225,111 @@ class SimulatorController {
     }
 }
 
+// MARK: - IPA Analysis
+
+class IPAAnalyzer {
+    static func extractURLSchemes(from appPath: String) -> [String] {
+        var schemes: [String] = []
+        let infoPlistPath = "\(appPath)/Info.plist"
+        
+        // Use plutil to extract CFBundleURLTypes
+        let result = shell("plutil -extract CFBundleURLTypes json '\(infoPlistPath)' 2>/dev/null || echo '[]'")
+        
+        if let data = result.output.data(using: .utf8),
+           let urlTypes = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            for urlType in urlTypes {
+                if let urlSchemes = urlType["CFBundleURLSchemes"] as? [String] {
+                    schemes.append(contentsOf: urlSchemes)
+                }
+            }
+        }
+        
+        return schemes
+    }
+    
+    static func extractCommonScreens() -> [String] {
+        // Common screen names/identifiers
+        return [
+            "home", "main", "dashboard", "feed", "timeline",
+            "profile", "settings", "account", "user",
+            "discover", "explore", "search", "browse",
+            "messages", "chat", "inbox",
+            "notifications", "alerts",
+            "library", "saved", "favorites",
+            "create", "new", "add",
+            "menu", "more", "options"
+        ]
+    }
+    
+    static func generateDeepLinks(schemes: [String], screens: [String]) -> [String] {
+        var deepLinks: [String] = []
+        
+        for scheme in schemes {
+            // Try scheme://screen format
+            for screen in screens {
+                deepLinks.append("\(scheme)://\(screen)")
+            }
+            
+            // Try common patterns
+            deepLinks.append("\(scheme)://")
+            deepLinks.append("\(scheme)://main")
+            deepLinks.append("\(scheme)://home")
+            deepLinks.append("\(scheme)://dashboard")
+        }
+        
+        return deepLinks
+    }
+    
+    static func analyzeApp(appPath: String?, bundleId: String) -> AppAnalysis {
+        var analysis = AppAnalysis(bundleId: bundleId, appPath: appPath)
+        
+        if let appPath = appPath, FileManager.default.fileExists(atPath: appPath) {
+            // Extract URL schemes
+            let schemes = extractURLSchemes(from: appPath)
+            analysis.navigationInfo.urlSchemes = schemes
+            
+            // Generate deep links
+            let commonScreens = extractCommonScreens()
+            analysis.navigationInfo.commonScreens = commonScreens
+            analysis.navigationInfo.deepLinkPaths = generateDeepLinks(schemes: schemes, screens: commonScreens)
+            
+            print("📱 Extracted \(schemes.count) URL schemes: \(schemes.joined(separator: ", "))")
+            print("🔗 Generated \(analysis.navigationInfo.deepLinkPaths.count) potential deep links")
+        }
+        
+        return analysis
+    }
+    
+    static func shell(_ command: String) -> (output: String, exitCode: Int32) {
+        let task = Process()
+        let pipe = Pipe()
+        
+        task.standardOutput = pipe
+        task.standardError = pipe
+        task.arguments = ["-c", command]
+        task.launchPath = "/bin/bash"
+        task.standardInput = nil
+        
+        do {
+            try task.run()
+            task.waitUntilExit()
+        } catch {
+            return ("Error: \(error)", 1)
+        }
+        
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        
+        return (output.trimmingCharacters(in: .whitespacesAndNewlines), task.terminationStatus)
+    }
+}
+
 // MARK: - App Explorer
 
 class AppExplorer {
     let controller: SimulatorController
     let credentials: Credentials?
+    let appAnalysis: AppAnalysis
     
     // Common button labels to look for
     let skipButtons = [
@@ -271,6 +384,12 @@ class AppExplorer {
     init(controller: SimulatorController, credentials: Credentials?) {
         self.controller = controller
         self.credentials = credentials
+        
+        // Analyze app for navigation info
+        self.appAnalysis = IPAAnalyzer.analyzeApp(
+            appPath: Config.appPath,
+            bundleId: controller.bundleId
+        )
     }
     
     // MARK: - Main Exploration Flow
@@ -306,11 +425,15 @@ class AppExplorer {
         print("\n[Step 5/7] Handling login...")
         handleLogin()
         
-        // Use deep link if provided (can bypass onboarding)
+        // Use deep links to navigate directly to screens
+        print("\n[Step 5.5/7] Trying deep link navigation...")
+        tryDeepLinkNavigation()
+        
+        // Use provided deep link if available
         if let deepLink = credentials?.deepLink {
-            print("\n[Step 5.5/7] Opening deep link...")
+            print("  → Trying provided deep link: \(deepLink)")
             controller.openDeepLink(deepLink)
-            controller.captureUniqueScreenshot("deep_link")
+            controller.captureUniqueScreenshot("deep_link_provided")
             sleep(2)
         }
         
@@ -339,6 +462,38 @@ class AppExplorer {
         print("  → Injecting common UserDefaults keys...")
         controller.injectUserDefaults(onboardingUserDefaults)
         sleep(1)
+        
+        // Method 2: Inject Keychain items (if app checks keychain for auth)
+        injectKeychainAuth()
+    }
+    
+    func injectKeychainAuth() {
+        print("  → Injecting keychain authentication...")
+        // Some apps check keychain for auth tokens
+        let bundleId = controller.bundleId
+        let commands = [
+            "security add-generic-password -a '\(bundleId)' -s 'auth_token' -w 'test_token' -U 2>/dev/null || true",
+            "security add-generic-password -a '\(bundleId)' -s 'user_id' -w 'test_user' -U 2>/dev/null || true",
+            "security add-generic-password -a '\(bundleId)' -s 'isAuthenticated' -w 'true' -U 2>/dev/null || true"
+        ]
+        
+        for cmd in commands {
+            controller.shell(cmd)
+        }
+    }
+    
+    func injectEnvironmentVariables() {
+        print("  → Setting environment variables...")
+        // Some apps check environment variables for test mode
+        let envVars = [
+            "SKIP_ONBOARDING=true",
+            "UITESTS_MODE=true",
+            "TEST_MODE=true",
+            "AUTOMATION=true"
+        ]
+        
+        // Note: simctl doesn't directly support env vars, but we can try via launch arguments
+        // This is more of a placeholder for future enhancement
     }
     
     func attemptLaunchWithSkipArgs() {
@@ -369,8 +524,28 @@ class AppExplorer {
         // Capture current screen
         controller.captureUniqueScreenshot("check_onboarding")
         
-        // Try multiple skip methods
-        // Method 1: Try skip button positions
+        // Method 1: Try deep links to skip onboarding (NEW!)
+        if !appAnalysis.navigationInfo.deepLinkPaths.isEmpty {
+            print("  → Trying deep links to bypass onboarding...")
+            let priorityLinks = appAnalysis.navigationInfo.deepLinkPaths.filter { link in
+                link.contains("://home") || link.contains("://main") || link.contains("://dashboard")
+            }
+            
+            for link in priorityLinks.prefix(3) {
+                let beforeHash = captureCurrentScreenHash()
+                controller.openDeepLink(link)
+                sleep(2)
+                
+                let afterHash = captureCurrentScreenHash()
+                if afterHash != beforeHash && !afterHash.isEmpty {
+                    print("  ✓ Deep link bypassed onboarding: \(link)")
+                    controller.captureUniqueScreenshot("deeplink_skip")
+                    return true
+                }
+            }
+        }
+        
+        // Method 2: Try skip button positions
         print("  → Trying skip button positions...")
         let skipPositions = [
             (x: 350, y: 50),   // Top right
@@ -395,7 +570,7 @@ class AppExplorer {
             }
         }
         
-        // Method 2: Try swiping through quickly (reduced from 5 to 3)
+        // Method 3: Try swiping through quickly (reduced from 5 to 3)
         print("  → Trying quick swipe through...")
         let swipeBeforeHash = captureCurrentScreenHash()
         for i in 0..<3 {
@@ -409,7 +584,7 @@ class AppExplorer {
             }
         }
         
-        // Method 3: Try custom skip button text if provided
+        // Method 4: Try custom skip button text if provided
         if let customSkip = credentials?.skipButtonText {
             print("  → Looking for custom skip: \(customSkip)")
             // Would need OCR/accessibility API here
@@ -584,6 +759,80 @@ class AppExplorer {
         }
         
         // Use deep link if provided (already handled in main explore flow)
+    }
+    
+    // MARK: - Deep Link Navigation
+    
+    func tryDeepLinkNavigation() {
+        let deepLinks = appAnalysis.navigationInfo.deepLinkPaths
+        
+        if deepLinks.isEmpty {
+            print("  ⚠️ No deep links extracted from app")
+            return
+        }
+        
+        print("  → Trying \(deepLinks.count) extracted deep links...")
+        
+        // Try top priority deep links first (home, main, dashboard)
+        let priorityLinks = deepLinks.filter { link in
+            link.contains("://home") || 
+            link.contains("://main") || 
+            link.contains("://dashboard") ||
+            link.contains("://")
+        }
+        
+        // Try priority links first
+        for (index, link) in priorityLinks.prefix(5).enumerated() {
+            print("    Trying deep link \(index + 1)/\(min(5, priorityLinks.count)): \(link)")
+            let beforeHash = captureCurrentScreenHash()
+            
+            controller.openDeepLink(link)
+            sleep(2)
+            
+            let afterHash = captureCurrentScreenHash()
+            if afterHash != beforeHash && !afterHash.isEmpty {
+                print("    ✓ Deep link worked: \(link)")
+                controller.captureUniqueScreenshot("deeplink_\(index + 1)")
+                
+                // If this deep link worked, try navigating to other screens
+                navigateToScreensViaDeepLinks()
+                return
+            }
+        }
+        
+        print("  ⚠️ No working deep links found")
+    }
+    
+    func navigateToScreensViaDeepLinks() {
+        print("  → Navigating to specific screens via deep links...")
+        
+        // Get unique screens to try (excluding already tried ones)
+        let screensToTry = [
+            "profile", "settings", "search", "discover",
+            "messages", "notifications", "library", "create"
+        ]
+        
+        let schemes = appAnalysis.navigationInfo.urlSchemes
+        if schemes.isEmpty {
+            return
+        }
+        
+        let primaryScheme = schemes[0]
+        
+        for (index, screen) in screensToTry.prefix(6).enumerated() {
+            let deepLink = "\(primaryScheme)://\(screen)"
+            print("    Trying screen: \(screen)")
+            
+            let beforeHash = captureCurrentScreenHash()
+            controller.openDeepLink(deepLink)
+            sleep(2)
+            
+            let afterHash = captureCurrentScreenHash()
+            if afterHash != beforeHash && !afterHash.isEmpty {
+                print("    ✓ Navigated to \(screen)")
+                controller.captureUniqueScreenshot("screen_\(screen)")
+            }
+        }
     }
     
     // MARK: - Tab Exploration
