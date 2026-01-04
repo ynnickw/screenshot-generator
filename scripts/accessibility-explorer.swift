@@ -73,14 +73,46 @@ class SimulatorController {
     
     // MARK: - App Control
     
-    func launchApp() {
+    func injectUserDefaults(_ defaults: [(key: String, value: String, type: String)]) {
+        // Inject UserDefaults before launching app
+        // This can skip onboarding for many apps
+        for (key, value, type) in defaults {
+            let command: String
+            switch type {
+            case "bool":
+                command = "xcrun simctl spawn '\(deviceName)' defaults write '\(bundleId)' '\(key)' -bool \(value)"
+            case "string":
+                command = "xcrun simctl spawn '\(deviceName)' defaults write '\(bundleId)' '\(key)' '\(value)'"
+            case "int":
+                command = "xcrun simctl spawn '\(deviceName)' defaults write '\(bundleId)' '\(key)' -int \(value)"
+            default:
+                command = "xcrun simctl spawn '\(deviceName)' defaults write '\(bundleId)' '\(key)' '\(value)'"
+            }
+            shell(command)
+        }
+    }
+    
+    func launchApp(withArguments args: [String] = []) {
         print("Launching app: \(bundleId)")
-        shell("xcrun simctl launch '\(deviceName)' '\(bundleId)'")
+        
+        if args.isEmpty {
+            shell("xcrun simctl launch '\(deviceName)' '\(bundleId)'")
+        } else {
+            // Launch with arguments
+            let argsString = args.map { "'\($0)'" }.joined(separator: " ")
+            shell("xcrun simctl launch '\(deviceName)' '\(bundleId)' \(argsString)")
+        }
         sleep(3) // Wait for app to launch
     }
     
     func terminateApp() {
         shell("xcrun simctl terminate '\(deviceName)' '\(bundleId)'")
+    }
+    
+    func openDeepLink(_ url: String) {
+        print("Opening deep link: \(url)")
+        shell("xcrun simctl openurl '\(deviceName)' '\(url)'")
+        sleep(2)
     }
     
     // MARK: - Screenshot Capture
@@ -156,6 +188,15 @@ class SimulatorController {
         usleep(500000)
     }
     
+    func swipeUp() {
+        let deviceWidth = deviceName.contains("iPad") ? 1024 : 393
+        let deviceHeight = deviceName.contains("iPad") ? 1366 : 852
+        let centerX = deviceWidth / 2
+        
+        shell("xcrun simctl io '\(deviceName)' swipe \(centerX) 100 \(centerX) \(deviceHeight - 100)")
+        usleep(500000)
+    }
+    
     func pressHome() {
         shell("xcrun simctl io '\(deviceName)' keycode home")
         usleep(500000)
@@ -194,6 +235,30 @@ class AppExplorer {
         "Swipe", "Tutorial"
     ]
     
+    // Common UserDefaults keys that apps use to track onboarding
+    let onboardingUserDefaults = [
+        ("hasSeenOnboarding", "true", "bool"),
+        ("onboardingComplete", "true", "bool"),
+        ("hasCompletedOnboarding", "true", "bool"),
+        ("isOnboardingComplete", "true", "bool"),
+        ("onboardingShown", "true", "bool"),
+        ("firstLaunch", "false", "bool"),
+        ("hasLaunchedBefore", "true", "bool"),
+        ("skipOnboarding", "true", "bool"),
+        ("tutorialCompleted", "true", "bool"),
+        ("welcomeShown", "true", "bool")
+    ]
+    
+    // Common launch arguments to skip onboarding
+    let skipOnboardingArgs = [
+        "-skipOnboarding",
+        "-UITests",
+        "-disableOnboarding",
+        "-skipTutorial",
+        "-testMode",
+        "-automation"
+    ]
+    
     // Tab bar positions (approximate for common layouts)
     let tabPositions = [
         (x: 60, label: "Tab 1"),
@@ -215,27 +280,135 @@ class AppExplorer {
         print("Device: \(controller.deviceName)")
         print("Bundle ID: \(controller.bundleId)")
         
-        // Launch the app
-        controller.launchApp()
+        // Try to skip onboarding BEFORE launching
+        attemptSkipOnboardingPreLaunch()
+        
+        // Launch the app (with skip arguments if needed)
+        attemptLaunchWithSkipArgs()
         
         // Capture launch screen
-        controller.captureScreenshot("launch")
+        controller.captureUniqueScreenshot("launch")
+        sleep(1)
         
-        // Handle onboarding
-        handleOnboarding()
+        // Quick check if we're past onboarding
+        let initialHash = captureCurrentScreenHash()
+        
+        // Try to skip onboarding if still present
+        if !attemptSkipOnboardingPostLaunch() {
+            // If skip failed, try to navigate through onboarding
+            handleOnboarding()
+        }
         
         // Handle login if needed
         handleLogin()
         
-        // Explore main app
+        // Use deep link if provided (can bypass onboarding)
+        if let deepLink = credentials?.deepLink {
+            controller.openDeepLink(deepLink)
+            controller.captureUniqueScreenshot("deep_link")
+            sleep(2)
+        }
+        
+        // Explore main app systematically
         exploreTabs()
         exploreMainContent()
+        exploreNavigationStack()
         
         // Generate URL list file
         generateUrlList()
         
         print("\n✅ Exploration complete!")
-        print("Total screenshots: \(controller.screenshotCount)")
+        print("Total unique screenshots: \(controller.screenshotCount)")
+    }
+    
+    // MARK: - Onboarding Skip Methods
+    
+    func attemptSkipOnboardingPreLaunch() {
+        print("\n🔧 Attempting to skip onboarding (pre-launch)...")
+        
+        // Method 1: Inject UserDefaults
+        print("  → Injecting common UserDefaults keys...")
+        controller.injectUserDefaults(onboardingUserDefaults)
+        sleep(1)
+    }
+    
+    func attemptLaunchWithSkipArgs() {
+        // Try launching with skip arguments
+        print("  → Launching with skip arguments...")
+        for arg in skipOnboardingArgs {
+            controller.launchApp(withArguments: [arg])
+            sleep(2)
+            
+            // Check if app launched successfully
+            let hash = captureCurrentScreenHash()
+            if !hash.isEmpty {
+                print("  ✓ Launched with argument: \(arg)")
+                return
+            }
+        }
+        
+        // Fallback to normal launch
+        controller.launchApp()
+    }
+    
+    func attemptSkipOnboardingPostLaunch() -> Bool {
+        print("\n🔍 Checking if onboarding is present...")
+        
+        // Capture current screen
+        controller.captureUniqueScreenshot("check_onboarding")
+        
+        // Try multiple skip methods
+        // Method 1: Try skip button positions
+        print("  → Trying skip button positions...")
+        let skipPositions = [
+            (x: 350, y: 50),   // Top right
+            (x: 350, y: 100),  // Below status bar
+            (x: 200, y: 800),  // Bottom center
+            (x: 200, y: 750),  // Above bottom
+            (x: 300, y: 50),   // Top right alternative
+            (x: 50, y: 50),    // Top left (sometimes skip is here)
+        ]
+        
+        let beforeHash = captureCurrentScreenHash()
+        
+        for pos in skipPositions {
+            controller.tap(x: pos.x, y: pos.y)
+            usleep(800000)
+            
+            let afterHash = captureCurrentScreenHash()
+            if afterHash != beforeHash && !afterHash.isEmpty {
+                print("  ✓ Screen changed after tap at (\(pos.x), \(pos.y))")
+                controller.captureUniqueScreenshot("after_skip")
+                return true
+            }
+        }
+        
+        // Method 2: Try swiping through quickly
+        print("  → Trying quick swipe through...")
+        for _ in 0..<5 {
+            controller.swipeLeft()
+            usleep(500000)
+            let hash = captureCurrentScreenHash()
+            if !hash.isEmpty {
+                controller.captureUniqueScreenshot("swipe_skip")
+            }
+        }
+        
+        // Method 3: Try custom skip button text if provided
+        if let customSkip = credentials?.skipButtonText {
+            print("  → Looking for custom skip: \(customSkip)")
+            // Would need OCR/accessibility API here
+        }
+        
+        return false
+    }
+    
+    func captureCurrentScreenHash() -> String {
+        let tempPath = "\(controller.outputDir)/temp_hash_check.png"
+        controller.shell("xcrun simctl io '\(controller.deviceName)' screenshot '\(tempPath)'")
+        let hashResult = controller.shell("md5 -q '\(tempPath)'")
+        try? FileManager.default.removeItem(atPath: tempPath)
+        return hashResult.output
     }
     
     // MARK: - Onboarding Handler
@@ -339,12 +512,7 @@ class AppExplorer {
             // Would use accessibility/OCR to find and tap
         }
         
-        // Use deep link if provided
-        if let deepLink = creds.deepLink {
-            print("Opening deep link: \(deepLink)")
-            controller.shell("xcrun simctl openurl '\(controller.deviceName)' '\(deepLink)'")
-            sleep(2)
-        }
+        // Use deep link if provided (already handled in main explore flow)
     }
     
     // MARK: - Tab Exploration
@@ -355,19 +523,25 @@ class AppExplorer {
         // Get device-specific tab bar Y position
         let tabBarY = controller.deviceName.contains("iPad") ? 1330 : 820
         
-        // Determine number of tabs (assume 3-5)
+        // Try different numbers of tabs (most apps have 3-5)
         let deviceWidth = controller.deviceName.contains("iPad") ? 1024 : 393
-        let tabCount = 5
-        let tabSpacing = deviceWidth / tabCount
         
-        for i in 0..<tabCount {
-            let tabX = tabSpacing / 2 + (i * tabSpacing)
+        // Try 3, 4, and 5 tabs
+        for tabCount in [3, 4, 5] {
+            let tabSpacing = deviceWidth / tabCount
             
-            print("Tapping tab \(i + 1) at position (\(tabX), \(tabBarY))")
-            controller.tap(x: tabX, y: tabBarY)
-            sleep(1)
-            
-            controller.captureUniqueScreenshot("tab_\(i + 1)")
+            for i in 0..<tabCount {
+                let tabX = tabSpacing / 2 + (i * tabSpacing)
+                
+                print("Tapping tab \(i + 1) of \(tabCount) at position (\(tabX), \(tabBarY))")
+                controller.tap(x: tabX, y: tabBarY)
+                sleep(1)
+                
+                controller.captureUniqueScreenshot("tab_\(i + 1)")
+                
+                // Explore content within this tab
+                exploreContentInCurrentView()
+            }
         }
     }
     
@@ -376,35 +550,118 @@ class AppExplorer {
     func exploreMainContent() {
         print("\n🔍 Exploring main content...")
         
-        // Tap on various screen positions to find interactive elements
-        let interactivePositions = [
-            (x: 200, y: 200, label: "top_content"),
-            (x: 200, y: 350, label: "mid_content_1"),
-            (x: 200, y: 500, label: "mid_content_2"),
-            (x: 200, y: 650, label: "bottom_content"),
-        ]
+        // Grid-based exploration - tap on a grid of positions
+        let deviceWidth = controller.deviceName.contains("iPad") ? 1024 : 393
+        let deviceHeight = controller.deviceName.contains("iPad") ? 1366 : 852
         
-        for pos in interactivePositions {
-            print("Exploring: \(pos.label)")
-            controller.tap(x: pos.x, y: pos.y)
-            sleep(1)
-            
-            // Capture if new screen appeared
-            controller.captureUniqueScreenshot(pos.label)
-            
-            // Try to go back
-            // Tap back button position (top left)
-            controller.tap(x: 30, y: 60)
-            sleep(1)
+        // Create a 3x4 grid of tap positions
+        let gridCols = 3
+        let gridRows = 4
+        let colSpacing = deviceWidth / (gridCols + 1)
+        let rowSpacing = (deviceHeight - 200) / (gridRows + 1) // Leave space for tab bar
+        
+        for row in 0..<gridRows {
+            for col in 0..<gridCols {
+                let x = colSpacing * (col + 1)
+                let y = 100 + (rowSpacing * (row + 1))
+                
+                print("Exploring grid position (\(col + 1), \(row + 1))")
+                let beforeHash = captureCurrentScreenHash()
+                
+                controller.tap(x: x, y: y)
+                sleep(1)
+                
+                let afterHash = captureCurrentScreenHash()
+                if afterHash != beforeHash && !afterHash.isEmpty {
+                    controller.captureUniqueScreenshot("grid_\(col + 1)_\(row + 1)")
+                    
+                    // Explore this new screen
+                    exploreContentInCurrentView()
+                    
+                    // Navigate back
+                    navigateBack()
+                }
+            }
         }
         
         // Scroll down and capture more content
         print("Scrolling to find more content...")
-        for i in 0..<3 {
+        for i in 0..<5 {
             controller.swipeDown()
+            sleep(1)
             controller.captureUniqueScreenshot("scroll_\(i + 1)")
         }
+        
+        // Scroll up
+        print("Scrolling up...")
+        for i in 0..<3 {
+            controller.swipeUp()
+            sleep(1)
+            controller.captureUniqueScreenshot("scroll_up_\(i + 1)")
+        }
     }
+    
+    func exploreContentInCurrentView() {
+        // Quick exploration of current view
+        // Try tapping common interactive areas
+        let quickTaps = [
+            (x: 200, y: 300),
+            (x: 200, y: 500),
+            (x: 100, y: 400),
+            (x: 300, y: 400)
+        ]
+        
+        for tap in quickTaps {
+            let beforeHash = captureCurrentScreenHash()
+            controller.tap(x: tap.x, y: tap.y)
+            sleep(1)
+            
+            let afterHash = captureCurrentScreenHash()
+            if afterHash != beforeHash && !afterHash.isEmpty {
+                controller.captureUniqueScreenshot("detail_view")
+                navigateBack()
+                break
+            }
+        }
+    }
+    
+    func exploreNavigationStack() {
+        print("\n🗺️ Exploring navigation stack...")
+        
+        // Try to find and tap navigation items
+        // Many apps have navigation items in the top area
+        let navPositions = [
+            (x: 50, y: 100),   // Top left (back button area)
+            (x: 350, y: 100),  // Top right (menu/settings)
+            (x: 200, y: 100),  // Top center (title area, sometimes tappable)
+        ]
+        
+        for pos in navPositions {
+            let beforeHash = captureCurrentScreenHash()
+            controller.tap(x: pos.x, y: pos.y)
+            sleep(1)
+            
+            let afterHash = captureCurrentScreenHash()
+            if afterHash != beforeHash && !afterHash.isEmpty {
+                controller.captureUniqueScreenshot("nav_item")
+                navigateBack()
+            }
+        }
+    }
+    
+    func navigateBack() {
+        // Try multiple back navigation methods
+        // Method 1: Top left back button
+        controller.tap(x: 30, y: 60)
+        sleep(1)
+        
+        // Method 2: Swipe from left edge (iOS back gesture)
+        let deviceHeight = controller.deviceName.contains("iPad") ? 1366 : 852
+        let centerY = deviceHeight / 2
+        controller.shell("xcrun simctl io '\(controller.deviceName)' swipe 10 \(centerY) 100 \(centerY)")
+        sleep(1)
+    }
+    
     
     // MARK: - URL List Generation
     

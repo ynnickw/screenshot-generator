@@ -38,12 +38,13 @@ temp/
 screenshots/
 
 # API server (deployed separately)
-api/
-api/dist/
-api/node_modules/
+src/
+dist/
+
 
 # Keep only what GitHub Actions needs
 !.github/
 !scripts/
 !fastlane/
+!package.json
 !README.md
