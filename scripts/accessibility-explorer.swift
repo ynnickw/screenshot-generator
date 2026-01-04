@@ -276,49 +276,58 @@ class AppExplorer {
     // MARK: - Main Exploration Flow
     
     func explore() {
+        let startTime = Date()
         print("\n🚀 Starting app exploration...")
         print("Device: \(controller.deviceName)")
         print("Bundle ID: \(controller.bundleId)")
+        print("Start time: \(startTime)")
         
         // Try to skip onboarding BEFORE launching
+        print("\n[Step 1/7] Pre-launch onboarding skip...")
         attemptSkipOnboardingPreLaunch()
         
         // Launch the app (with skip arguments if needed)
+        print("\n[Step 2/7] Launching app...")
         attemptLaunchWithSkipArgs()
         
         // Capture launch screen
+        print("\n[Step 3/7] Capturing launch screen...")
         controller.captureUniqueScreenshot("launch")
         sleep(1)
         
         // Quick check if we're past onboarding
-        let initialHash = captureCurrentScreenHash()
-        
-        // Try to skip onboarding if still present
+        print("\n[Step 4/7] Handling onboarding...")
         if !attemptSkipOnboardingPostLaunch() {
             // If skip failed, try to navigate through onboarding
             handleOnboarding()
         }
         
         // Handle login if needed
+        print("\n[Step 5/7] Handling login...")
         handleLogin()
         
         // Use deep link if provided (can bypass onboarding)
         if let deepLink = credentials?.deepLink {
+            print("\n[Step 5.5/7] Opening deep link...")
             controller.openDeepLink(deepLink)
             controller.captureUniqueScreenshot("deep_link")
             sleep(2)
         }
         
         // Explore main app systematically
+        print("\n[Step 6/7] Exploring app content...")
         exploreTabs()
         exploreMainContent()
         exploreNavigationStack()
         
         // Generate URL list file
+        print("\n[Step 7/7] Generating URL list...")
         generateUrlList()
         
+        let elapsed = Date().timeIntervalSince(startTime)
         print("\n✅ Exploration complete!")
         print("Total unique screenshots: \(controller.screenshotCount)")
+        print("Total time: \(String(format: "%.1f", elapsed)) seconds")
     }
     
     // MARK: - Onboarding Skip Methods
@@ -333,9 +342,11 @@ class AppExplorer {
     }
     
     func attemptLaunchWithSkipArgs() {
-        // Try launching with skip arguments
+        // Try launching with skip arguments (limit to first 3 to save time)
         print("  → Launching with skip arguments...")
-        for arg in skipOnboardingArgs {
+        let argsToTry = Array(skipOnboardingArgs.prefix(3))
+        for arg in argsToTry {
+            print("    Trying: \(arg)")
             controller.launchApp(withArguments: [arg])
             sleep(2)
             
@@ -348,6 +359,7 @@ class AppExplorer {
         }
         
         // Fallback to normal launch
+        print("  → Using normal launch")
         controller.launchApp()
     }
     
@@ -383,14 +395,17 @@ class AppExplorer {
             }
         }
         
-        // Method 2: Try swiping through quickly
+        // Method 2: Try swiping through quickly (reduced from 5 to 3)
         print("  → Trying quick swipe through...")
-        for _ in 0..<5 {
+        let swipeBeforeHash = captureCurrentScreenHash()
+        for i in 0..<3 {
             controller.swipeLeft()
             usleep(500000)
-            let hash = captureCurrentScreenHash()
-            if !hash.isEmpty {
+            let swipeAfterHash = captureCurrentScreenHash()
+            if swipeAfterHash != swipeBeforeHash && !swipeAfterHash.isEmpty {
+                print("  ✓ Screen changed after swipe")
                 controller.captureUniqueScreenshot("swipe_skip")
+                return true
             }
         }
         
@@ -400,6 +415,7 @@ class AppExplorer {
             // Would need OCR/accessibility API here
         }
         
+        print("  ⚠️ Could not skip onboarding automatically")
         return false
     }
     
@@ -414,17 +430,47 @@ class AppExplorer {
     // MARK: - Onboarding Handler
     
     func handleOnboarding() {
-        print("\n📱 Checking for onboarding...")
+        print("\n📱 Handling onboarding flow...")
         
         var onboardingScreens = 0
-        let maxOnboardingScreens = 8
+        let maxOnboardingScreens = 5 // Reduced from 8
+        var lastHash = ""
+        var stuckCount = 0
+        let maxStuckCount = 2 // Exit if stuck on same screen twice
         
         while onboardingScreens < maxOnboardingScreens {
+            print("  → Onboarding screen \(onboardingScreens + 1)/\(maxOnboardingScreens)")
+            
             // Capture current screen
-            controller.captureUniqueScreenshot("onboarding_\(onboardingScreens)")
+            let currentHash = captureCurrentScreenHash()
+            if !currentHash.isEmpty {
+                controller.captureUniqueScreenshot("onboarding_\(onboardingScreens)")
+            }
+            
+            // Check if we're stuck on the same screen
+            if currentHash == lastHash && !currentHash.isEmpty {
+                stuckCount += 1
+                print("  ⚠️ Same screen detected (stuck count: \(stuckCount))")
+                if stuckCount >= maxStuckCount {
+                    print("  ⚠️ Stuck on same screen, trying to skip...")
+                    trySkipButtons()
+                    sleep(2)
+                    // Check if we moved past onboarding
+                    let newHash = captureCurrentScreenHash()
+                    if newHash != currentHash {
+                        print("  ✓ Successfully skipped onboarding")
+                        break
+                    } else {
+                        print("  ⚠️ Still stuck, forcing exit from onboarding")
+                        break
+                    }
+                }
+            } else {
+                stuckCount = 0
+            }
+            lastHash = currentHash
             
             // Try to advance onboarding
-            // First, try tapping common "Next" button positions
             let nextButtonPositions = [
                 (x: 200, y: 750),  // Bottom center iPhone
                 (x: 350, y: 800),  // Bottom right iPhone
@@ -436,26 +482,39 @@ class AppExplorer {
                 controller.tap(x: pos.x, y: pos.y)
                 sleep(1)
                 
-                // Check if screen changed (simplified check)
-                advanced = true
-                break
+                // Actually check if screen changed
+                let newHash = captureCurrentScreenHash()
+                if newHash != currentHash && !newHash.isEmpty {
+                    advanced = true
+                    print("  ✓ Screen advanced after tap")
+                    break
+                }
             }
             
             if !advanced {
                 // Try swiping left
+                print("  → Trying swipe...")
                 controller.swipeLeft()
+                sleep(1)
+                
+                // Check if swipe worked
+                let newHash = captureCurrentScreenHash()
+                if newHash != currentHash && !newHash.isEmpty {
+                    advanced = true
+                    print("  ✓ Screen advanced after swipe")
+                }
             }
             
             onboardingScreens += 1
             
-            // Check for skip button or main content
-            // In a real implementation, we'd use OCR or accessibility APIs
-            sleep(1)
+            // Small delay between screens
+            usleep(500000)
         }
         
-        // Try to skip onboarding
-        print("Trying to skip onboarding...")
+        // Final attempt to skip onboarding
+        print("  → Final skip attempt...")
         trySkipButtons()
+        sleep(2)
     }
     
     func trySkipButtons() {
@@ -467,10 +526,22 @@ class AppExplorer {
             (x: 200, y: 750),  // Above bottom
         ]
         
-        for pos in skipPositions {
+        let beforeHash = captureCurrentScreenHash()
+        
+        for (index, pos) in skipPositions.enumerated() {
+            print("    Trying skip position \(index + 1)/\(skipPositions.count) at (\(pos.x), \(pos.y))")
             controller.tap(x: pos.x, y: pos.y)
-            usleep(500000)
+            usleep(800000)
+            
+            // Check if screen changed
+            let afterHash = captureCurrentScreenHash()
+            if afterHash != beforeHash && !afterHash.isEmpty {
+                print("    ✓ Screen changed after skip tap")
+                return
+            }
         }
+        
+        print("    ⚠️ No skip button found")
     }
     
     // MARK: - Login Handler
@@ -526,22 +597,46 @@ class AppExplorer {
         // Try different numbers of tabs (most apps have 3-5)
         let deviceWidth = controller.deviceName.contains("iPad") ? 1024 : 393
         
-        // Try 3, 4, and 5 tabs
-        for tabCount in [3, 4, 5] {
+        // Try 4 tabs first (most common), then 3 and 5 if needed
+        let tabCounts = [4, 3, 5]
+        var foundTabs = false
+        
+        for tabCount in tabCounts {
             let tabSpacing = deviceWidth / tabCount
+            var uniqueScreens = 0
+            
+            print("Trying \(tabCount) tabs...")
             
             for i in 0..<tabCount {
                 let tabX = tabSpacing / 2 + (i * tabSpacing)
                 
-                print("Tapping tab \(i + 1) of \(tabCount) at position (\(tabX), \(tabBarY))")
+                print("  → Tapping tab \(i + 1) of \(tabCount) at position (\(tabX), \(tabBarY))")
+                let beforeHash = captureCurrentScreenHash()
                 controller.tap(x: tabX, y: tabBarY)
                 sleep(1)
                 
-                controller.captureUniqueScreenshot("tab_\(i + 1)")
-                
-                // Explore content within this tab
-                exploreContentInCurrentView()
+                let afterHash = captureCurrentScreenHash()
+                if afterHash != beforeHash && !afterHash.isEmpty {
+                    uniqueScreens += 1
+                    controller.captureUniqueScreenshot("tab_\(i + 1)")
+                    
+                    // Only explore content for first 2 tabs to save time
+                    if i < 2 {
+                        exploreContentInCurrentView()
+                    }
+                }
             }
+            
+            // If we found unique screens, assume this is the correct tab count
+            if uniqueScreens > 0 {
+                print("  ✓ Found \(uniqueScreens) unique tab screens with \(tabCount) tabs")
+                foundTabs = true
+                break
+            }
+        }
+        
+        if !foundTabs {
+            print("  ⚠️ No tabs found, continuing with main content exploration")
         }
     }
     
@@ -554,18 +649,26 @@ class AppExplorer {
         let deviceWidth = controller.deviceName.contains("iPad") ? 1024 : 393
         let deviceHeight = controller.deviceName.contains("iPad") ? 1366 : 852
         
-        // Create a 3x4 grid of tap positions
-        let gridCols = 3
-        let gridRows = 4
+        // Create a smaller 2x3 grid to reduce exploration time
+        let gridCols = 2
+        let gridRows = 3
         let colSpacing = deviceWidth / (gridCols + 1)
         let rowSpacing = (deviceHeight - 200) / (gridRows + 1) // Leave space for tab bar
         
+        var exploredScreens = 0
+        let maxExploredScreens = 5 // Limit to prevent infinite loops
+        
         for row in 0..<gridRows {
             for col in 0..<gridCols {
+                if exploredScreens >= maxExploredScreens {
+                    print("  ⚠️ Reached max exploration limit, stopping")
+                    break
+                }
+                
                 let x = colSpacing * (col + 1)
                 let y = 100 + (rowSpacing * (row + 1))
                 
-                print("Exploring grid position (\(col + 1), \(row + 1))")
+                print("  → Exploring grid position (\(col + 1), \(row + 1))")
                 let beforeHash = captureCurrentScreenHash()
                 
                 controller.tap(x: x, y: y)
@@ -573,42 +676,34 @@ class AppExplorer {
                 
                 let afterHash = captureCurrentScreenHash()
                 if afterHash != beforeHash && !afterHash.isEmpty {
+                    exploredScreens += 1
                     controller.captureUniqueScreenshot("grid_\(col + 1)_\(row + 1)")
                     
-                    // Explore this new screen
-                    exploreContentInCurrentView()
-                    
-                    // Navigate back
+                    // Navigate back (don't explore content to save time)
                     navigateBack()
+                    sleep(1)
                 }
+            }
+            if exploredScreens >= maxExploredScreens {
+                break
             }
         }
         
-        // Scroll down and capture more content
+        // Scroll down and capture more content (reduced from 5 to 3)
         print("Scrolling to find more content...")
-        for i in 0..<5 {
+        for i in 0..<3 {
+            print("  → Scroll \(i + 1)/3")
             controller.swipeDown()
             sleep(1)
             controller.captureUniqueScreenshot("scroll_\(i + 1)")
         }
-        
-        // Scroll up
-        print("Scrolling up...")
-        for i in 0..<3 {
-            controller.swipeUp()
-            sleep(1)
-            controller.captureUniqueScreenshot("scroll_up_\(i + 1)")
-        }
     }
     
     func exploreContentInCurrentView() {
-        // Quick exploration of current view
-        // Try tapping common interactive areas
+        // Quick exploration of current view - only try first 2 taps to save time
         let quickTaps = [
             (x: 200, y: 300),
-            (x: 200, y: 500),
-            (x: 100, y: 400),
-            (x: 300, y: 400)
+            (x: 200, y: 500)
         ]
         
         for tap in quickTaps {
