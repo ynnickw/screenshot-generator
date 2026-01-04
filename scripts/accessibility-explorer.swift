@@ -105,17 +105,60 @@ class SimulatorController {
         }
     }
     
-    func launchApp(withArguments args: [String] = []) {
+    func launchApp(withArguments args: [String] = []) -> Bool {
         print("Launching app: \(bundleId)")
         
+        // Capture home screen hash before launch
+        let homeScreenHash = captureCurrentScreenHash()
+        
+        let result: (output: String, exitCode: Int32)
         if args.isEmpty {
-            shell("xcrun simctl launch '\(deviceName)' '\(bundleId)'")
+            result = shell("xcrun simctl launch '\(deviceName)' '\(bundleId)'")
         } else {
             // Launch with arguments
             let argsString = args.map { "'\($0)'" }.joined(separator: " ")
-            shell("xcrun simctl launch '\(deviceName)' '\(bundleId)' \(argsString)")
+            result = shell("xcrun simctl launch '\(deviceName)' '\(bundleId)' \(argsString)")
         }
-        sleep(3) // Wait for app to launch
+        
+        if result.exitCode != 0 {
+            print("❌ Failed to launch app: \(result.output)")
+            return false
+        }
+        
+        print("  → Launch command executed, waiting for app to appear...")
+        
+        // Wait for app to launch and verify it's actually running
+        var attempts = 0
+        let maxAttempts = 10 // 10 seconds total
+        
+        while attempts < maxAttempts {
+            usleep(500000) // 0.5 second
+            let currentHash = captureCurrentScreenHash()
+            
+            // If screen changed from home screen, app likely launched
+            if currentHash != homeScreenHash && !currentHash.isEmpty {
+                print("  ✓ App launched successfully (screen changed)")
+                return true
+            }
+            
+            // Also check if app process is running using ps
+            let processCheck = shell("xcrun simctl spawn '\(deviceName)' ps aux | grep '\(bundleId)' | grep -v grep || echo ''")
+            if !processCheck.output.isEmpty {
+                print("  ✓ App process is running")
+                // Give it a bit more time for UI to appear
+                sleep(2)
+                let finalHash = captureCurrentScreenHash()
+                if finalHash != homeScreenHash && !finalHash.isEmpty {
+                    return true
+                }
+            }
+            
+            attempts += 1
+        }
+        
+        print("  ⚠️ App launch timeout - screen may not have changed")
+        // Still return true if launch command succeeded, but log warning
+        return result.exitCode == 0
     }
     
     func terminateApp() {
@@ -222,6 +265,17 @@ class SimulatorController {
         // For now, we'll use a simpler approach based on screen capture and OCR
         // This is a placeholder - in production, use XCTest framework
         return shell("xcrun simctl spawn '\(deviceName)' accessibility_inspector 2>/dev/null || echo ''").output
+    }
+    
+    func captureCurrentScreenHash() -> String {
+        let tempPath = "\(outputDir)/temp_hash_check.png"
+        let screenshotResult = shell("xcrun simctl io '\(deviceName)' screenshot '\(tempPath)'")
+        if screenshotResult.exitCode != 0 {
+            return ""
+        }
+        let hashResult = shell("md5 -q '\(tempPath)'")
+        try? FileManager.default.removeItem(atPath: tempPath)
+        return hashResult.output
     }
 }
 
@@ -407,7 +461,29 @@ class AppExplorer {
         
         // Launch the app (with skip arguments if needed)
         print("\n[Step 2/7] Launching app...")
-        attemptLaunchWithSkipArgs()
+        let launchSuccess = attemptLaunchWithSkipArgs()
+        
+        if !launchSuccess {
+            print("  ❌ WARNING: App launch may have failed. Continuing anyway...")
+        }
+        
+        // Verify we're not still on home screen
+        print("\n[Step 2.5/7] Verifying app is running...")
+        let homeScreenCheck = controller.captureCurrentScreenHash()
+        sleep(2) // Give app more time to fully load
+        let currentScreenCheck = controller.captureCurrentScreenHash()
+        
+        if homeScreenCheck == currentScreenCheck && !homeScreenCheck.isEmpty {
+            print("  ⚠️ WARNING: Still on home screen - app may not have launched")
+            print("  → Attempting to launch again...")
+            controller.pressHome()
+            sleep(1)
+            if !controller.launchApp() {
+                print("  ❌ CRITICAL: App failed to launch. Screenshots will show home screen.")
+            } else {
+                sleep(3) // Wait for app to fully load
+            }
+        }
         
         // Capture launch screen
         print("\n[Step 3/7] Capturing launch screen...")
@@ -496,26 +572,68 @@ class AppExplorer {
         // This is more of a placeholder for future enhancement
     }
     
-    func attemptLaunchWithSkipArgs() {
+    func attemptLaunchWithSkipArgs() -> Bool {
         // Try launching with skip arguments (limit to first 3 to save time)
         print("  → Launching with skip arguments...")
         let argsToTry = Array(skipOnboardingArgs.prefix(3))
         for arg in argsToTry {
             print("    Trying: \(arg)")
-            controller.launchApp(withArguments: [arg])
-            sleep(2)
-            
-            // Check if app launched successfully
-            let hash = captureCurrentScreenHash()
-            if !hash.isEmpty {
-                print("  ✓ Launched with argument: \(arg)")
-                return
+            if controller.launchApp(withArguments: [arg]) {
+                // Verify app actually launched by checking screen changed
+                let hash = controller.captureCurrentScreenHash()
+                if !hash.isEmpty {
+                    print("  ✓ Launched with argument: \(arg)")
+                    return true
+                }
             }
         }
         
         // Fallback to normal launch
         print("  → Using normal launch")
-        controller.launchApp()
+        if controller.launchApp() {
+            return true
+        } else {
+            print("  ❌ Failed to launch app! Attempting alternative method...")
+            // Try using UI automation to open app from home screen
+            attemptLaunchViaHomeScreen()
+            // Check if it worked
+            sleep(2)
+            let hash = controller.captureCurrentScreenHash()
+            return !hash.isEmpty
+        }
+    }
+    
+    func attemptLaunchViaHomeScreen() {
+        print("  → Attempting to launch app from home screen...")
+        
+        // First, make sure we're on home screen
+        controller.pressHome()
+        sleep(1)
+        
+        // Try to find and tap the app icon
+        // This is a fallback - we'll try common positions where app icons might be
+        let iconPositions = [
+            (x: 100, y: 200),  // First row, first column
+            (x: 200, y: 200),  // First row, second column
+            (x: 100, y: 350),  // Second row, first column
+            (x: 200, y: 350),  // Second row, second column
+        ]
+        
+        let initialHash = controller.captureCurrentScreenHash()
+        
+        for pos in iconPositions {
+            controller.tap(x: pos.x, y: pos.y)
+            sleep(2)
+            
+            // Check if screen changed (app might have opened)
+            let newHash = controller.captureCurrentScreenHash()
+            if newHash != initialHash && !newHash.isEmpty {
+                print("  ✓ App opened from home screen")
+                return
+            }
+        }
+        
+        print("  ⚠️ Could not launch app from home screen")
     }
     
     func attemptSkipOnboardingPostLaunch() -> Bool {
@@ -596,7 +714,10 @@ class AppExplorer {
     
     func captureCurrentScreenHash() -> String {
         let tempPath = "\(controller.outputDir)/temp_hash_check.png"
-        controller.shell("xcrun simctl io '\(controller.deviceName)' screenshot '\(tempPath)'")
+        let screenshotResult = controller.shell("xcrun simctl io '\(controller.deviceName)' screenshot '\(tempPath)'")
+        if screenshotResult.exitCode != 0 {
+            return ""
+        }
         let hashResult = controller.shell("md5 -q '\(tempPath)'")
         try? FileManager.default.removeItem(atPath: tempPath)
         return hashResult.output
