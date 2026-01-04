@@ -158,7 +158,7 @@ class SimulatorController {
         
         // Method 3: Use simctl to get the current app
         // This is the most reliable method
-        let appStateResult = shell("xcrun simctl listapps '\(deviceName)' 2>/dev/null | grep -A 5 '\(bundleId)' | grep -i 'state' || echo ''")
+        _ = shell("xcrun simctl listapps '\(deviceName)' 2>/dev/null | grep -A 5 '\(bundleId)' | grep -i 'state' || echo ''")
         // Note: This might not work for all simulators, so we'll use it as a hint
         
         // If we can't determine, check if app process exists but might be backgrounded
@@ -210,14 +210,43 @@ class SimulatorController {
             result = shell("xcrun simctl launch '\(deviceName)' '\(bundleId)' \(argsString) 2>&1")
         }
         
-        // If that failed, try alternative method
+        // If that failed, try alternative methods
         if result.exitCode != 0 {
-            print("  → Method 1 failed, trying alternative launch method...")
-            // Try using openurl with app scheme
+            print("  → Method 1 failed, trying alternative launch methods...")
+            
+            // Check if it's the SBMainWorkspace denial error (common with Flutter apps)
+            let isSBMainWorkspaceError = result.output.contains("SBMainWorkspace") || result.output.contains("denied by service delegate")
+            
+            if isSBMainWorkspaceError {
+                print("  → Detected SBMainWorkspace denial (common with Flutter apps)")
+                print("  → Will try launching via home screen icon tap")
+            }
+            
+            // Method 2: Try using openurl with app scheme
             let openResult = shell("xcrun simctl openurl '\(deviceName)' '\(bundleId)://' 2>&1")
-            if openResult.exitCode == 0 {
-                print("  → Alternative method (openurl) succeeded")
+            if openResult.exitCode == 0 && !openResult.output.lowercased().contains("error") && !openResult.output.lowercased().contains("denied") {
+                print("  → Method 2 (openurl) succeeded")
                 result = openResult
+            } else {
+                // Method 3: Launch via home screen icon tap
+                // This works for SBMainWorkspace errors and other launch failures
+                print("  → Method 3: Attempting to launch via home screen icon tap...")
+                if launchViaHomeScreenIcon() {
+                    print("  → Method 3 (icon tap) appears to have worked")
+                    // Give it time to launch
+                    sleep(3)
+                    // Verify app is running and not on SpringBoard
+                    if isAppProcessRunning() {
+                        if !isOnSpringBoard() {
+                            print("  ✓ App successfully launched via icon tap!")
+                            return true
+                        } else {
+                            print("  ⚠️ App process running but still on SpringBoard")
+                        }
+                    } else {
+                        print("  ⚠️ Icon tap didn't start app process")
+                    }
+                }
             }
         }
         
@@ -480,6 +509,88 @@ class SimulatorController {
     func pressHome() {
         shell("xcrun simctl io '\(deviceName)' keycode home")
         usleep(500000)
+    }
+    
+    func launchViaHomeScreenIcon() -> Bool {
+        print("    → Launching app via home screen icon tap...")
+        
+        // Make sure we're on home screen
+        pressHome()
+        sleep(2)  // Give SpringBoard time to fully load
+        
+        // Get device dimensions for icon grid
+        let isiPad = deviceName.contains("iPad")
+        let screenWidth = isiPad ? 1024 : 393
+        let screenHeight = isiPad ? 1366 : 852
+        
+        // Calculate icon grid positions (iOS typically has 4 icons per row on iPhone)
+        let iconsPerRow = isiPad ? 6 : 4
+        let iconSpacing = Double(screenWidth) / Double(iconsPerRow + 1)
+        let startY = Double(isiPad ? 200 : 150)  // Below status bar
+        let rowHeight = Double(isiPad ? 120 : 100)
+        
+        // Try tapping icons in a systematic grid pattern
+        // Start with first page, try first 2 rows, all columns
+        let maxRows = 2
+        let maxCols = iconsPerRow
+        
+        let initialHash = captureCurrentScreenHash()
+        var tappedPositions: [(x: Int, y: Int)] = []
+        
+        print("    → Searching for app icon in grid pattern...")
+        
+        for row in 0..<maxRows {
+            for col in 0..<maxCols {
+                let x = Int(iconSpacing * Double(col + 1))
+                let y = Int(startY + (Double(row) * rowHeight))
+                
+                // Skip if we've already tried this position
+                if tappedPositions.contains(where: { $0.x == x && $0.y == y }) {
+                    continue
+                }
+                
+                tappedPositions.append((x: x, y: y))
+                print("      → Tapping position (\(x), \(y)) - row \(row + 1), col \(col + 1)")
+                
+                tap(x: x, y: y)
+                sleep(3)  // Wait longer for app to launch
+                
+                // Check if app process started
+                if isAppProcessRunning() {
+                    // Check if we're no longer on SpringBoard
+                    if !isOnSpringBoard() {
+                        print("      ✓ App launched via icon tap! (process running, not on SpringBoard)")
+                        return true
+                    }
+                }
+                
+                // Check if screen changed significantly
+                let newHash = captureCurrentScreenHash()
+                if newHash != initialHash && !newHash.isEmpty {
+                    // Double check we're not on SpringBoard
+                    sleep(1)  // Give it a moment
+                    if !isOnSpringBoard() && isAppProcessRunning() {
+                        print("      ✓ App launched via icon tap! (screen changed, process running)")
+                        return true
+                    }
+                }
+                
+                // If we tapped something that opened (but not our app), go back to home
+                if newHash != initialHash {
+                    print("      → Something opened, returning to home screen...")
+                    pressHome()
+                    sleep(2)
+                    // Update initial hash for next iteration
+                    let updatedHash = captureCurrentScreenHash()
+                    if updatedHash != initialHash {
+                        // We're back on a different home screen state, continue
+                    }
+                }
+            }
+        }
+        
+        print("    ⚠️ Could not find app icon after trying \(tappedPositions.count) positions")
+        return false
     }
     
     // MARK: - UI Element Detection (using accessibility)
@@ -1263,7 +1374,7 @@ class AppExplorer {
         
         let primaryScheme = schemes[0]
         
-        for (index, screen) in screensToTry.prefix(6).enumerated() {
+        for (_, screen) in screensToTry.prefix(6).enumerated() {
             let deepLink = "\(primaryScheme)://\(screen)"
             print("    Trying screen: \(screen)")
             
