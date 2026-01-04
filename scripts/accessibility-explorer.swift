@@ -128,15 +128,63 @@ class SimulatorController {
         return !result.output.isEmpty
     }
     
+    func isOnSpringBoard() -> Bool {
+        // Method 1: Check if our app process is running
+        // If app is not running, we're definitely on SpringBoard
+        if !isAppProcessRunning() {
+            return true
+        }
+        
+        // Method 2: Check launchctl for foreground app
+        // This is more reliable than ps
+        let launchctlResult = shell("xcrun simctl spawn '\(deviceName)' launchctl list 2>/dev/null | grep 'UIKitApplication' | head -1 || echo ''")
+        let launchctlOutput = launchctlResult.output
+        
+        // If no UIKitApplication found, we're likely on SpringBoard
+        if launchctlOutput.isEmpty {
+            return true
+        }
+        
+        // Check if our bundle ID is in the output
+        // Format is usually: com.apple.springboard or our.bundle.id
+        if launchctlOutput.lowercased().contains(bundleId.lowercased()) {
+            return false // Our app is in foreground
+        }
+        
+        // If we see SpringBoard explicitly, we're on home screen
+        if launchctlOutput.lowercased().contains("springboard") {
+            return true
+        }
+        
+        // Method 3: Use simctl to get the current app
+        // This is the most reliable method
+        let appStateResult = shell("xcrun simctl listapps '\(deviceName)' 2>/dev/null | grep -A 5 '\(bundleId)' | grep -i 'state' || echo ''")
+        // Note: This might not work for all simulators, so we'll use it as a hint
+        
+        // If we can't determine, check if app process exists but might be backgrounded
+        // If process exists but we can't see it in launchctl, assume SpringBoard
+        return true // Conservative: assume SpringBoard if uncertain
+    }
+    
     func launchApp(withArguments args: [String] = []) -> Bool {
         print("Launching app: \(bundleId)")
         
         // First verify app is installed
+        print("  → Checking if app is installed...")
         if !isAppInstalled() {
             print("  ❌ App is not installed on simulator!")
+            // Debug: List all installed apps
+            let allApps = shell("xcrun simctl listapps '\(deviceName)' 2>/dev/null | head -20 || echo 'Could not list apps'")
+            print("  → Installed apps sample: \(allApps.output)")
             return false
         }
         print("  ✓ App is installed")
+        
+        // Debug: Show app info
+        let appInfo = shell("xcrun simctl listapps '\(deviceName)' 2>/dev/null | grep -A 10 '\(bundleId)' | head -15 || echo ''")
+        if !appInfo.output.isEmpty {
+            print("  → App info: \(appInfo.output)")
+        }
         
         // Capture home screen hash before launch
         let homeScreenHash = captureCurrentScreenHash()
@@ -148,15 +196,29 @@ class SimulatorController {
         pressHome()
         sleep(1)
         
-        let result: (output: String, exitCode: Int32)
+        // Try multiple launch methods
+        var result: (output: String, exitCode: Int32)
+        
+        // Method 1: Standard simctl launch
         if args.isEmpty {
-            print("  → Executing: xcrun simctl launch '\(deviceName)' '\(bundleId)'")
+            print("  → Method 1: xcrun simctl launch '\(deviceName)' '\(bundleId)'")
             result = shell("xcrun simctl launch '\(deviceName)' '\(bundleId)' 2>&1")
         } else {
             // Launch with arguments
             let argsString = args.map { "'\($0)'" }.joined(separator: " ")
-            print("  → Executing: xcrun simctl launch '\(deviceName)' '\(bundleId)' \(argsString)")
+            print("  → Method 1: xcrun simctl launch '\(deviceName)' '\(bundleId)' \(argsString)")
             result = shell("xcrun simctl launch '\(deviceName)' '\(bundleId)' \(argsString) 2>&1")
+        }
+        
+        // If that failed, try alternative method
+        if result.exitCode != 0 {
+            print("  → Method 1 failed, trying alternative launch method...")
+            // Try using openurl with app scheme
+            let openResult = shell("xcrun simctl openurl '\(deviceName)' '\(bundleId)://' 2>&1")
+            if openResult.exitCode == 0 {
+                print("  → Alternative method (openurl) succeeded")
+                result = openResult
+            }
         }
         
         // Check launch output for errors
@@ -167,9 +229,22 @@ class SimulatorController {
             let trimmedOutput = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmedOutput.isEmpty && trimmedOutput.allSatisfy({ $0.isNumber }) {
                 print("  ✓ Launch returned process ID: \(trimmedOutput)")
+                print("  → Process ID indicates launch command succeeded")
             } else if trimmedOutput.lowercased().contains("error") || trimmedOutput.lowercased().contains("fail") {
                 print("  ⚠️ Launch output suggests an error")
+            } else {
+                print("  → Launch output (non-numeric): \(trimmedOutput)")
             }
+        } else {
+            print("  → Launch command produced no output")
+        }
+        
+        // Debug: Check if process started immediately
+        print("  → Checking if app process started...")
+        if isAppProcessRunning() {
+            print("  ✓ App process is running immediately after launch")
+        } else {
+            print("  ⚠️ App process not detected immediately after launch")
         }
         
         if result.exitCode != 0 {
@@ -183,6 +258,13 @@ class SimulatorController {
         // Wait for app to start
         sleep(3)
         
+        // First check: Are we still on SpringBoard?
+        if isOnSpringBoard() {
+            print("  ⚠️ Still on SpringBoard (home screen) after launch")
+        } else {
+            print("  ✓ Not on SpringBoard - app may have launched")
+        }
+        
         // Check if app is in foreground
         if let foregroundApp = getForegroundApp() {
             print("  → Foreground app: \(foregroundApp)")
@@ -190,17 +272,27 @@ class SimulatorController {
                 print("  ✓ App is in foreground!")
                 // Give it a moment to fully render
                 sleep(1)
-                return true
+                // Double-check we're not on SpringBoard
+                if !isOnSpringBoard() {
+                    return true
+                } else {
+                    print("  ⚠️ App process detected but still on SpringBoard")
+                }
             } else {
                 print("  ⚠️ Different app in foreground: \(foregroundApp)")
             }
         }
         
-        // Check if screen changed
+        // Check if screen changed AND we're not on SpringBoard
         let quickCheck = captureCurrentScreenHash()
         if quickCheck != homeScreenHash && !quickCheck.isEmpty {
-            print("  ✓ App launched successfully (screen changed)")
-            return true
+            // Verify we're actually not on SpringBoard
+            if !isOnSpringBoard() {
+                print("  ✓ App launched successfully (screen changed and not on SpringBoard)")
+                return true
+            } else {
+                print("  ⚠️ Screen hash changed but still on SpringBoard")
+            }
         }
         
         // Wait for app to launch and verify it's actually running
@@ -210,19 +302,38 @@ class SimulatorController {
         while attempts < maxAttempts {
             usleep(500000) // 0.5 second
             
+            // Check if we're still on SpringBoard
+            if isOnSpringBoard() {
+                print("  → Still on SpringBoard (attempt \(attempts + 1))")
+            } else {
+                print("  ✓ Not on SpringBoard - app may have launched!")
+                // Verify app process is running
+                if isAppProcessRunning() {
+                    sleep(1)
+                    return true
+                }
+            }
+            
             // Check foreground app
             if let foregroundApp = getForegroundApp(), foregroundApp.contains(bundleId) {
                 print("  ✓ App is now in foreground!")
                 sleep(1)
-                return true
+                // Double-check we're not on SpringBoard
+                if !isOnSpringBoard() {
+                    return true
+                }
             }
             
             let currentHash = captureCurrentScreenHash()
             
-            // If screen changed from home screen, app likely launched
+            // If screen changed from home screen AND we're not on SpringBoard, app likely launched
             if currentHash != homeScreenHash && !currentHash.isEmpty {
-                print("  ✓ App launched successfully (screen changed on attempt \(attempts + 1))")
-                return true
+                if !isOnSpringBoard() {
+                    print("  ✓ App launched successfully (screen changed and not on SpringBoard on attempt \(attempts + 1))")
+                    return true
+                } else {
+                    print("  ⚠️ Screen changed but still on SpringBoard")
+                }
             }
             
             // Check process on every 2nd attempt
@@ -253,11 +364,21 @@ class SimulatorController {
             }
         }
         
+        // Final check: Are we on SpringBoard?
+        if isOnSpringBoard() {
+            print("  ❌ Still on SpringBoard - app did not launch")
+            return false
+        }
+        
         // Check one final time if screen changed
         let finalCheck = captureCurrentScreenHash()
         if finalCheck != homeScreenHash && !finalCheck.isEmpty {
-            print("  ✓ App appeared on final screen check")
-            return true
+            if !isOnSpringBoard() {
+                print("  ✓ App appeared on final screen check")
+                return true
+            } else {
+                print("  ❌ Screen changed but still on SpringBoard")
+            }
         }
         
         print("  ❌ App launch verification failed - app may not have launched")
@@ -627,20 +748,44 @@ class AppExplorer {
         // Final verification: Make absolutely sure we're not on home screen
         print("\n[Step 2.75/7] Final app launch verification...")
         
-        // Check if app process is running
-        if !controller.isAppProcessRunning() {
-            print("  ❌ CRITICAL: App process is not running!")
+        // Check if we're on SpringBoard (home screen)
+        if controller.isOnSpringBoard() {
+            print("  ❌ CRITICAL: Still on SpringBoard (home screen)!")
             print("  → Attempting emergency launch...")
             controller.pressHome()
             sleep(1)
             if controller.launchApp() {
                 print("  ✓ Emergency launch succeeded")
-                sleep(2)
+                sleep(3)
+                // Check again
+                if controller.isOnSpringBoard() {
+                    print("  ❌ FATAL: Still on SpringBoard after emergency launch")
+                    print("  → App may not be launching properly")
+                    print("  → Check app installation and bundle ID: \(controller.bundleId)")
+                    print("  → Aborting screenshot capture to avoid home screen screenshots")
+                    return // Exit early to prevent home screen screenshots
+                }
+            } else {
+                print("  ❌ FATAL: Emergency launch failed")
+                print("  → Aborting screenshot capture to avoid home screen screenshots")
+                return // Exit early
+            }
+        }
+        
+        // Check if app process is running
+        if !controller.isAppProcessRunning() {
+            print("  ❌ CRITICAL: App process is not running!")
+            print("  → Attempting one more launch...")
+            if controller.launchApp() {
+                sleep(3)
+                if controller.isOnSpringBoard() || !controller.isAppProcessRunning() {
+                    print("  ❌ FATAL: App still not running after relaunch")
+                    print("  → Aborting screenshot capture")
+                    return
+                }
             } else {
                 print("  ❌ FATAL: Cannot launch app. Aborting screenshot capture.")
-                print("  → This will result in home screen screenshots.")
-                print("  → Check app installation and bundle ID: \(controller.bundleId)")
-                // Continue anyway but log the error clearly
+                return
             }
         } else {
             print("  ✓ App process is running")
@@ -649,19 +794,19 @@ class AppExplorer {
         // Final screen check - compare with home screen
         let finalScreenCheck = controller.captureCurrentScreenHash()
         if finalScreenCheck == homeScreenCheck && !finalScreenCheck.isEmpty {
-            print("  ⚠️ WARNING: Still appears to be on home screen")
-            print("  → Attempting one more launch attempt...")
-            controller.pressHome()
-            sleep(1)
-            if controller.launchApp() {
-                print("  ✓ Final launch attempt succeeded")
-                sleep(2)
-            } else {
-                print("  ❌ Final launch attempt failed")
-                print("  → Screenshots will likely show home screen")
+            print("  ⚠️ WARNING: Screen hash matches home screen")
+            if controller.isOnSpringBoard() {
+                print("  ❌ FATAL: Confirmed on SpringBoard - aborting")
+                return
             }
         } else if !finalScreenCheck.isEmpty {
             print("  ✓ Screen verification passed - app appears to be running")
+        }
+        
+        // One final SpringBoard check before screenshots
+        if controller.isOnSpringBoard() {
+            print("  ❌ FATAL: Final check - still on SpringBoard. Aborting.")
+            return
         }
         
         // Capture launch screen
