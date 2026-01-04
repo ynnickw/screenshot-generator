@@ -180,105 +180,91 @@ class SimulatorController {
         }
         print("  ✓ App is installed")
         
-        // Debug: Show app info
-        let appInfo = shell("xcrun simctl listapps '\(deviceName)' 2>/dev/null | grep -A 10 '\(bundleId)' | head -15 || echo ''")
-        if !appInfo.output.isEmpty {
-            print("  → App info: \(appInfo.output)")
-        }
-        
-        // Capture home screen hash before launch
-        let homeScreenHash = captureCurrentScreenHash()
-        if homeScreenHash.isEmpty {
-            print("  ⚠️ Could not capture home screen, continuing anyway...")
-        }
+        // Terminate any existing instance first
+        print("  → Terminating any existing app instance...")
+        shell("xcrun simctl terminate '\(deviceName)' '\(bundleId)' 2>/dev/null")
+        sleep(1)
         
         // Make sure we're on home screen first
         pressHome()
-        sleep(1)
+        sleep(2)  // Give SpringBoard time to settle
         
-        // Try multiple launch methods
-        var result: (output: String, exitCode: Int32)
+        // Capture home screen hash before launch
+        let homeScreenHash = captureCurrentScreenHash()
         
-        // Method 1: Standard simctl launch
-        if args.isEmpty {
-            print("  → Method 1: xcrun simctl launch '\(deviceName)' '\(bundleId)'")
-            result = shell("xcrun simctl launch '\(deviceName)' '\(bundleId)' 2>&1")
+        // Try multiple launch methods in order of reliability
+        var launchSucceeded = false
+        
+        // Method 1: Standard simctl launch (no arguments for first attempt)
+        print("  → Method 1: Standard launch without arguments...")
+        var result = shell("xcrun simctl launch '\(deviceName)' '\(bundleId)' 2>&1")
+        
+        if result.exitCode == 0 {
+            print("  ✓ Launch command succeeded")
+            launchSucceeded = true
         } else {
-            // Launch with arguments
-            let argsString = args.map { "'\($0)'" }.joined(separator: " ")
-            print("  → Method 1: xcrun simctl launch '\(deviceName)' '\(bundleId)' \(argsString)")
-            result = shell("xcrun simctl launch '\(deviceName)' '\(bundleId)' \(argsString) 2>&1")
-        }
-        
-        // If that failed, try alternative methods
-        if result.exitCode != 0 {
-            print("  → Method 1 failed, trying alternative launch methods...")
+            print("  → Method 1 failed: \(result.output)")
             
-            // Check if it's the SBMainWorkspace denial error (common with Flutter apps)
-            let isSBMainWorkspaceError = result.output.contains("SBMainWorkspace") || result.output.contains("denied by service delegate")
+            // Method 2: Try with --console-pty flag (sometimes helps)
+            print("  → Method 2: Launch with --console-pty flag...")
+            result = shell("xcrun simctl launch --console-pty '\(deviceName)' '\(bundleId)' &")
+            sleep(2)
             
-            if isSBMainWorkspaceError {
-                print("  → Detected SBMainWorkspace denial (common with Flutter apps)")
-                print("  → Will try launching via home screen icon tap")
-            }
-            
-            // Method 2: Try using openurl with app scheme
-            let openResult = shell("xcrun simctl openurl '\(deviceName)' '\(bundleId)://' 2>&1")
-            if openResult.exitCode == 0 && !openResult.output.lowercased().contains("error") && !openResult.output.lowercased().contains("denied") {
-                print("  → Method 2 (openurl) succeeded")
-                result = openResult
+            if isAppProcessRunning() {
+                print("  ✓ App process running after console-pty launch")
+                launchSucceeded = true
             } else {
-                // Method 3: Launch via home screen icon tap
-                // This works for SBMainWorkspace errors and other launch failures
-                print("  → Method 3: Attempting to launch via home screen icon tap...")
-                if launchViaHomeScreenIcon() {
-                    print("  → Method 3 (icon tap) appears to have worked")
-                    // Give it time to launch
-                    sleep(3)
-                    // Verify app is running and not on SpringBoard
-                    if isAppProcessRunning() {
-                        if !isOnSpringBoard() {
-                            print("  ✓ App successfully launched via icon tap!")
-                            return true
-                        } else {
-                            print("  ⚠️ App process running but still on SpringBoard")
+                // Method 3: Try open command (macOS native)
+                print("  → Method 3: Using open command...")
+                let deviceUDID = shell("xcrun simctl list devices | grep '\(deviceName)' | grep -oE '[0-9A-F-]{36}' | head -1").output
+                if !deviceUDID.isEmpty {
+                    shell("open -a Simulator")
+                    sleep(2)
+                }
+                
+                // Method 4: Launch via Spotlight/openurl
+                print("  → Method 4: Launch via openurl...")
+                shell("xcrun simctl openurl '\(deviceName)' '\(bundleId)://' 2>&1")
+                sleep(2)
+                
+                if isAppProcessRunning() {
+                    print("  ✓ App process running after openurl")
+                    launchSucceeded = true
+                } else {
+                    // Method 5: Launch via home screen icon tap
+                    print("  → Method 5: Launch via home screen icon tap...")
+                    if launchViaHomeScreenIcon() {
+                        sleep(3)
+                        if isAppProcessRunning() {
+                            print("  ✓ App launched via icon tap!")
+                            launchSucceeded = true
                         }
-                    } else {
-                        print("  ⚠️ Icon tap didn't start app process")
                     }
                 }
             }
         }
         
-        // Check launch output for errors
-        if !result.output.isEmpty {
-            print("  → Launch output: \(result.output)")
-            // xcrun simctl launch returns process ID on success (e.g., "12345")
-            // If output contains only digits, it's likely a successful launch
-            let trimmedOutput = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmedOutput.isEmpty && trimmedOutput.allSatisfy({ $0.isNumber }) {
-                print("  ✓ Launch returned process ID: \(trimmedOutput)")
-                print("  → Process ID indicates launch command succeeded")
-            } else if trimmedOutput.lowercased().contains("error") || trimmedOutput.lowercased().contains("fail") {
-                print("  ⚠️ Launch output suggests an error")
-            } else {
-                print("  → Launch output (non-numeric): \(trimmedOutput)")
-            }
-        } else {
-            print("  → Launch command produced no output")
-        }
+        // Wait for app to start
+        sleep(3)
         
-        // Debug: Check if process started immediately
+        // Check if process is now running
         print("  → Checking if app process started...")
         if isAppProcessRunning() {
-            print("  ✓ App process is running immediately after launch")
+            print("  ✓ App process is running")
+            launchSucceeded = true
         } else {
-            print("  ⚠️ App process not detected immediately after launch")
+            print("  ⚠️ App process not detected")
         }
         
-        if result.exitCode != 0 {
-            print("  ❌ Launch command failed with exit code \(result.exitCode)")
-            print("  → Error: \(result.output)")
+        // Check if screen changed from home
+        let currentHash = captureCurrentScreenHash()
+        if !currentHash.isEmpty && currentHash != homeScreenHash {
+            print("  ✓ Screen changed from home screen")
+            launchSucceeded = true
+        }
+        
+        if !launchSucceeded {
+            print("  ❌ All launch methods failed")
             return false
         }
         
@@ -480,8 +466,9 @@ class SimulatorController {
     
     func swipeLeft() {
         // Swipe from right to left (for onboarding screens)
-        let deviceWidth = deviceName.contains("iPad") ? 1024 : 393
-        let deviceHeight = deviceName.contains("iPad") ? 1366 : 852
+        // iPhone 15 Pro Max: 430 x 932 points, iPad Pro 12.9": 1024 x 1366 points
+        let deviceWidth = deviceName.contains("iPad") ? 1024 : 430
+        let deviceHeight = deviceName.contains("iPad") ? 1366 : 932
         let centerY = deviceHeight / 2
         
         shell("xcrun simctl io '\(deviceName)' swipe \(deviceWidth - 50) \(centerY) 50 \(centerY)")
@@ -489,8 +476,8 @@ class SimulatorController {
     }
     
     func swipeDown() {
-        let deviceWidth = deviceName.contains("iPad") ? 1024 : 393
-        let deviceHeight = deviceName.contains("iPad") ? 1366 : 852
+        let deviceWidth = deviceName.contains("iPad") ? 1024 : 430
+        let deviceHeight = deviceName.contains("iPad") ? 1366 : 932
         let centerX = deviceWidth / 2
         
         shell("xcrun simctl io '\(deviceName)' swipe \(centerX) \(deviceHeight - 100) \(centerX) 100")
@@ -498,8 +485,8 @@ class SimulatorController {
     }
     
     func swipeUp() {
-        let deviceWidth = deviceName.contains("iPad") ? 1024 : 393
-        let deviceHeight = deviceName.contains("iPad") ? 1366 : 852
+        let deviceWidth = deviceName.contains("iPad") ? 1024 : 430
+        let deviceHeight = deviceName.contains("iPad") ? 1366 : 932
         let centerX = deviceWidth / 2
         
         shell("xcrun simctl io '\(deviceName)' swipe \(centerX) 100 \(centerX) \(deviceHeight - 100)")
@@ -518,16 +505,20 @@ class SimulatorController {
         pressHome()
         sleep(2)  // Give SpringBoard time to fully load
         
-        // Get device dimensions for icon grid
+        // Get device dimensions for icon grid (these are point coordinates, not pixels)
+        // iPhone 15 Pro Max: 430 x 932 points
+        // iPad Pro 12.9": 1024 x 1366 points
         let isiPad = deviceName.contains("iPad")
-        let screenWidth = isiPad ? 1024 : 393
-        let screenHeight = isiPad ? 1366 : 852
+        let screenWidth = isiPad ? 1024 : 430
+        let screenHeight = isiPad ? 1366 : 932
         
-        // Calculate icon grid positions (iOS typically has 4 icons per row on iPhone)
+        // Calculate icon grid positions
+        // iPhone: 4 icons per row, starting around y=120, row height ~100
+        // iPad: 6 icons per row
         let iconsPerRow = isiPad ? 6 : 4
         let iconSpacing = Double(screenWidth) / Double(iconsPerRow + 1)
-        let startY = Double(isiPad ? 200 : 150)  // Below status bar
-        let rowHeight = Double(isiPad ? 120 : 100)
+        let startY = Double(isiPad ? 200 : 120)  // Below notch/dynamic island
+        let rowHeight = Double(isiPad ? 120 : 110)
         
         // Try tapping icons in a systematic grid pattern
         // Start with first page, try first 2 rows, all columns
@@ -805,12 +796,42 @@ class AppExplorer {
     
     // MARK: - Main Exploration Flow
     
+    func verifySimulatorReady() -> Bool {
+        print("  → Verifying simulator is ready...")
+        
+        // Check if SpringBoard is running
+        let springboardCheck = controller.shell("xcrun simctl spawn '\(controller.deviceName)' launchctl list 2>/dev/null | grep -i 'springboard' || echo ''")
+        if springboardCheck.output.isEmpty {
+            print("  ⚠️ SpringBoard not detected, waiting...")
+            // Wait up to 10 seconds for SpringBoard
+            for i in 1...10 {
+                sleep(1)
+                let retryCheck = controller.shell("xcrun simctl spawn '\(controller.deviceName)' launchctl list 2>/dev/null | grep -i 'springboard' || echo ''")
+                if !retryCheck.output.isEmpty {
+                    print("  ✓ SpringBoard is ready")
+                    sleep(1) // Give it a moment to fully initialize
+                    return true
+                }
+                print("    Waiting... (\(i)/10)")
+            }
+            print("  ⚠️ SpringBoard still not ready, continuing anyway...")
+            return false
+        }
+        
+        print("  ✓ Simulator is ready")
+        return true
+    }
+    
     func explore() {
         let startTime = Date()
         print("\n🚀 Starting app exploration...")
         print("Device: \(controller.deviceName)")
         print("Bundle ID: \(controller.bundleId)")
         print("Start time: \(startTime)")
+        
+        // Verify simulator is ready before proceeding
+        print("\n[Step 0/7] Verifying simulator readiness...")
+        verifySimulatorReady()
         
         // Try to skip onboarding BEFORE launching
         print("\n[Step 1/7] Pre-launch onboarding skip...")
@@ -1007,34 +1028,30 @@ class AppExplorer {
     }
     
     func attemptLaunchWithSkipArgs() -> Bool {
-        // Try launching with skip arguments (limit to first 3 to save time)
-        print("  → Launching with skip arguments...")
-        let argsToTry = Array(skipOnboardingArgs.prefix(3))
-        for arg in argsToTry {
-            print("    Trying: \(arg)")
-            if controller.launchApp(withArguments: [arg]) {
-                // Verify app actually launched by checking screen changed
-                let hash = controller.captureCurrentScreenHash()
-                if !hash.isEmpty {
-                    print("  ✓ Launched with argument: \(arg)")
-                    return true
-                }
+        // Try normal launch first (without arguments) - this is most reliable
+        print("  → Trying normal launch first (no arguments)...")
+        if controller.launchApp() {
+            // Verify app actually launched
+            sleep(2)
+            if controller.isAppProcessRunning() && !controller.isOnSpringBoard() {
+                print("  ✓ App launched successfully!")
+                return true
             }
         }
         
-        // Fallback to normal launch
-        print("  → Using normal launch")
-        if controller.launchApp() {
+        print("  → Normal launch didn't work, trying via home screen icon...")
+        // Try launching via home screen icon tap
+        attemptLaunchViaHomeScreen()
+        sleep(3)
+        
+        // Check if it worked
+        if controller.isAppProcessRunning() {
+            print("  ✓ App launched via home screen icon!")
             return true
-        } else {
-            print("  ❌ Failed to launch app! Attempting alternative method...")
-            // Try using UI automation to open app from home screen
-            attemptLaunchViaHomeScreen()
-            // Check if it worked
-            sleep(2)
-            let hash = controller.captureCurrentScreenHash()
-            return !hash.isEmpty
         }
+        
+        print("  ❌ All launch attempts failed")
+        return false
     }
     
     func attemptLaunchViaHomeScreen() {
@@ -1396,10 +1413,11 @@ class AppExplorer {
         print("\n📑 Exploring tabs...")
         
         // Get device-specific tab bar Y position
-        let tabBarY = controller.deviceName.contains("iPad") ? 1330 : 820
+        // iPhone 15 Pro Max: tab bar is around y=900, iPad Pro 12.9": y=1330
+        let tabBarY = controller.deviceName.contains("iPad") ? 1330 : 900
         
         // Try different numbers of tabs (most apps have 3-5)
-        let deviceWidth = controller.deviceName.contains("iPad") ? 1024 : 393
+        let deviceWidth = controller.deviceName.contains("iPad") ? 1024 : 430
         
         // Try 4 tabs first (most common), then 3 and 5 if needed
         let tabCounts = [4, 3, 5]
@@ -1450,8 +1468,8 @@ class AppExplorer {
         print("\n🔍 Exploring main content...")
         
         // Grid-based exploration - tap on a grid of positions
-        let deviceWidth = controller.deviceName.contains("iPad") ? 1024 : 393
-        let deviceHeight = controller.deviceName.contains("iPad") ? 1366 : 852
+        let deviceWidth = controller.deviceName.contains("iPad") ? 1024 : 430
+        let deviceHeight = controller.deviceName.contains("iPad") ? 1366 : 932
         
         // Create a smaller 2x3 grid to reduce exploration time
         let gridCols = 2
@@ -1555,7 +1573,7 @@ class AppExplorer {
         sleep(1)
         
         // Method 2: Swipe from left edge (iOS back gesture)
-        let deviceHeight = controller.deviceName.contains("iPad") ? 1366 : 852
+        let deviceHeight = controller.deviceName.contains("iPad") ? 1366 : 932
         let centerY = deviceHeight / 2
         controller.shell("xcrun simctl io '\(controller.deviceName)' swipe 10 \(centerY) 100 \(centerY)")
         sleep(1)

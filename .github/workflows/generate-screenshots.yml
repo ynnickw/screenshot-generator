@@ -56,11 +56,24 @@ jobs:
           VERSION=$(plutil -extract CFBundleShortVersionString raw "$APP_PATH/Info.plist")
           BUILD_NUMBER=$(plutil -extract CFBundleVersion raw "$APP_PATH/Info.plist")
           DISPLAY_NAME=$(plutil -extract CFBundleDisplayName raw "$APP_PATH/Info.plist" 2>/dev/null || echo "")
+          APP_EXECUTABLE=$(plutil -extract CFBundleExecutable raw "$APP_PATH/Info.plist")
           
           echo "Bundle ID: $BUNDLE_ID"
           echo "Version: $VERSION"
           echo "Build: $BUILD_NUMBER"
           echo "Display Name: $DISPLAY_NAME"
+          echo "Executable: $APP_EXECUTABLE"
+          
+          # Remove quarantine attributes (critical for downloaded apps)
+          echo "Removing quarantine attributes..."
+          xattr -cr "$APP_PATH"
+          
+          # Ensure executable permissions
+          chmod +x "$APP_PATH/$APP_EXECUTABLE" 2>/dev/null || true
+          
+          # List app contents for debugging
+          echo "App bundle contents:"
+          ls -la "$APP_PATH/" | head -15
           
           echo "app_path=$APP_PATH" >> $GITHUB_OUTPUT
           echo "bundle_id=$BUNDLE_ID" >> $GITHUB_OUTPUT
@@ -72,13 +85,63 @@ jobs:
           echo "Booting iPhone 15 Pro Max simulator..."
           xcrun simctl boot "iPhone 15 Pro Max" || true
           xcrun simctl bootstatus "iPhone 15 Pro Max" -b
+          echo "Waiting for SpringBoard to be ready..."
+          # Wait for SpringBoard to be fully ready (can take a few seconds after boot)
+          for i in {1..30}; do
+            if xcrun simctl spawn "iPhone 15 Pro Max" launchctl list 2>/dev/null | grep -q "com.apple.springboard"; then
+              echo "SpringBoard is ready"
+              break
+            fi
+            echo "Waiting for SpringBoard... ($i/30)"
+            sleep 1
+          done
+          # Additional wait to ensure SpringBoard is fully initialized
+          sleep 2
           echo "iPhone simulator ready"
 
       - name: Install App on iPhone
         run: |
           echo "Installing app on iPhone..."
+          
+          # Remove quarantine attribute (apps downloaded from internet are blocked)
+          echo "Removing quarantine attribute..."
+          xattr -cr "${{ steps.extract.outputs.app_path }}"
+          
+          # Verify the app binary is executable
+          APP_EXECUTABLE=$(plutil -extract CFBundleExecutable raw "${{ steps.extract.outputs.app_path }}/Info.plist")
+          echo "App executable: $APP_EXECUTABLE"
+          chmod +x "${{ steps.extract.outputs.app_path }}/$APP_EXECUTABLE" 2>/dev/null || true
+          
+          # Install app
           xcrun simctl install "iPhone 15 Pro Max" "${{ steps.extract.outputs.app_path }}"
-          echo "App installed on iPhone"
+          
+          # Wait a moment for installation to complete
+          sleep 2
+          
+          # Verify installation
+          if xcrun simctl listapps "iPhone 15 Pro Max" 2>/dev/null | grep -q "${{ steps.extract.outputs.bundle_id }}"; then
+            echo "✓ App installed successfully on iPhone"
+          else
+            echo "⚠️ Warning: App may not have installed correctly"
+          fi
+
+      - name: Debug - Test App Launch
+        run: |
+          echo "Testing app launch before screenshot capture..."
+          # Try basic launch first
+          echo "Attempting xcrun simctl launch..."
+          xcrun simctl launch "iPhone 15 Pro Max" "${{ steps.extract.outputs.bundle_id }}" 2>&1 || true
+          sleep 3
+          
+          # Check if process started
+          echo "Checking if app process is running..."
+          xcrun simctl spawn "iPhone 15 Pro Max" ps -A 2>/dev/null | grep -i "${{ steps.extract.outputs.bundle_id }}" || echo "Process not found"
+          
+          # Take a screenshot to see what's on screen
+          echo "Taking debug screenshot..."
+          xcrun simctl io "iPhone 15 Pro Max" screenshot screenshots/iphone/debug_launch_test.png 2>&1 || true
+          ls -la screenshots/iphone/ || true
+        continue-on-error: true
 
       - name: Capture iPhone Screenshots
         env:
@@ -102,13 +165,45 @@ jobs:
           echo "Booting iPad Pro simulator..."
           xcrun simctl boot "iPad Pro (12.9-inch) (6th generation)" || true
           xcrun simctl bootstatus "iPad Pro (12.9-inch) (6th generation)" -b
+          echo "Waiting for SpringBoard to be ready..."
+          # Wait for SpringBoard to be fully ready (can take a few seconds after boot)
+          for i in {1..30}; do
+            if xcrun simctl spawn "iPad Pro (12.9-inch) (6th generation)" launchctl list 2>/dev/null | grep -q "com.apple.springboard"; then
+              echo "SpringBoard is ready"
+              break
+            fi
+            echo "Waiting for SpringBoard... ($i/30)"
+            sleep 1
+          done
+          # Additional wait to ensure SpringBoard is fully initialized
+          sleep 2
           echo "iPad simulator ready"
 
       - name: Install App on iPad
         run: |
           echo "Installing app on iPad..."
+          
+          # Remove quarantine attribute (apps downloaded from internet are blocked)
+          echo "Removing quarantine attribute..."
+          xattr -cr "${{ steps.extract.outputs.app_path }}"
+          
+          # Verify the app binary is executable
+          APP_EXECUTABLE=$(plutil -extract CFBundleExecutable raw "${{ steps.extract.outputs.app_path }}/Info.plist")
+          echo "App executable: $APP_EXECUTABLE"
+          chmod +x "${{ steps.extract.outputs.app_path }}/$APP_EXECUTABLE" 2>/dev/null || true
+          
+          # Install app
           xcrun simctl install "iPad Pro (12.9-inch) (6th generation)" "${{ steps.extract.outputs.app_path }}"
-          echo "App installed on iPad"
+          
+          # Wait a moment for installation to complete
+          sleep 2
+          
+          # Verify installation
+          if xcrun simctl listapps "iPad Pro (12.9-inch) (6th generation)" 2>/dev/null | grep -q "${{ steps.extract.outputs.bundle_id }}"; then
+            echo "✓ App installed successfully on iPad"
+          else
+            echo "⚠️ Warning: App may not have installed correctly"
+          fi
 
       - name: Capture iPad Screenshots
         env:
